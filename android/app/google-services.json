@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "483155719934",
+    "project_id": "seetheworld-57efc",
+    "storage_bucket": "seetheworld-57efc.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:483155719934:android:c4187719571ebde091d7af",
+        "android_client_info": {
+          "package_name": "com.example.see_the_world"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAkPB57sJJjdnZTLvj_NZurTcCHcYpyqyQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
