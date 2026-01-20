@@ -23,7 +23,7 @@ unor trasee turistice, cu suport online si offline.
 - Shared Preferences pentru stocare locala
 - Image Picker + Path Provider pentru fotografii locale
 
-## Structura pe scurt
+## Structura 
 - `lib/pages/home_page.dart`: harta, cautare, rute, top places.
 - `lib/pages/offline_tours_page.dart`: tururi offline.
 - `lib/pages/favorite_places_page.dart`: favorite si detalii.
