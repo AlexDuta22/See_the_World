@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  TEMPLATE. Copiaza acest fisier in google_maps_api.xml (acelasi folder) si
+  inlocuieste YOUR_MAPS_API_KEY cu cheia ta reala din Google Cloud Console.
+  google_maps_api.xml este gitignored si NU trebuie comis.
+-->
+<resources>
+    <string name="google_maps_api_key">YOUR_MAPS_API_KEY</string>
+    <string name="google_directions_api_key">YOUR_MAPS_API_KEY</string>
+    <string name="google_places_api_key">YOUR_MAPS_API_KEY</string>
+    <string name="google_navigation_api_key">YOUR_MAPS_API_KEY</string>
+    <string name="google_places_ui_kit_api_key">YOUR_MAPS_API_KEY</string>
+</resources>

@@ -27,11 +27,12 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   final String _apiKey = _defaultApiKey;
   String _partialText = '';
 
-  // Cheia ta Gemini. Pune-o aici între ghilimele (defaultValue) sau
-  // furnizeaz-o la build cu --dart-define=GEMINI_API_KEY=...
+  // Cheia Gemini NU se pune în cod. Se furnizează la build dintr-un fișier
+  // gitignored:
+  //   flutter run --dart-define-from-file=dart_defines.json
+  // Vezi dart_defines.example.json pentru format.
   static const String _defaultApiKey = String.fromEnvironment(
     'GEMINI_API_KEY',
-    defaultValue: 'AIzaSyBvf3c5i8stciC_pavxwdi0FUtTVXVXV74',
   );
 
   static const String _model = 'gemini-2.5-flash';
