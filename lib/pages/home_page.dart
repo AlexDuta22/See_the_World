@@ -17,13 +17,15 @@ import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'ai_assistant_page.dart';
 import 'favorite_places_page.dart';
 import 'offline_tours_page.dart';
 import 'profile_page.dart';
 import '../widgets/app_bottom_nav.dart';
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+  const HomePage({super.key, this.showTour = false});
+  final bool showTour;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -53,12 +55,16 @@ class _HomePageState extends State<HomePage> {
   List<_NavStep> _navSteps = [];
   List<_OfflinePlace> _offlinePlaces = [];
   Set<Marker> _tourMarkers = {};
+  bool _showTourMarkers = false;
+  Set<Polyline> _tourPolylines = {};
+  String? _activeCategory;
+  Set<Marker> _categoryMarkers = {};
 
   static const CameraPosition _initialCameraPosition = CameraPosition(
     target: LatLng(45.7489, 21.2087), // Timisoara
     zoom: 13,
   );
-  static const String _offlineTimisoaraTourKey = 'offline_tour_timisoara';
+  static const String _offlineTimisoaraTourKey = 'offline_tour_timisoara_v2';
   static const double _nearbyRadiusMeters = 5000;
   static const double _fieldOfViewDegrees = 45;
 
@@ -84,14 +90,6 @@ class _HomePageState extends State<HomePage> {
       ? _googlePlacesApiKey
       : _googleMapsApiKey;
 
-  static final List<Marker> _sampleMarkers = [
-    const Marker(
-      markerId: MarkerId('biserica-centrala'),
-      position: LatLng(45.7561, 21.2286),
-      infoWindow: InfoWindow(title: 'Biserica Centrala'),
-    ),
-  ];
-
   @override
   void initState() {
     super.initState();
@@ -115,8 +113,6 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    final sheetColor = isDark ? Colors.black : Colors.white;
-    final titleColor = isDark ? Colors.white : Colors.black;
     return Scaffold(
       resizeToAvoidBottomInset: false,
       appBar: AppBar(
@@ -151,8 +147,9 @@ class _HomePageState extends State<HomePage> {
               final markers = _proximityActive ? _nearbyMarkers : baseMarkers;
               final combinedMarkers = <Marker>{
                 ...markers,
-                ..._tourMarkers,
+                if (_showTourMarkers) ..._tourMarkers,
                 ..._searchMarkers,
+                ..._categoryMarkers,
               };
               return GoogleMap(
                 onMapCreated: (controller) {
@@ -160,10 +157,8 @@ class _HomePageState extends State<HomePage> {
                   if (_hasLocationPermission) _goToCurrentLocation();
                 },
                 initialCameraPosition: _initialCameraPosition,
-                markers: combinedMarkers.isEmpty
-                    ? _markersWithNavigationTap()
-                    : combinedMarkers,
-                polylines: _polylines,
+                markers: combinedMarkers,
+                polylines: {..._polylines, ..._tourPolylines},
                 myLocationEnabled: _hasLocationPermission,
                 myLocationButtonEnabled: _hasLocationPermission,
                 compassEnabled: true,
@@ -229,6 +224,58 @@ class _HomePageState extends State<HomePage> {
               ),
             ),
           ),
+          if (_navSteps.isEmpty)
+            Positioned(
+              top: 70,
+              left: 0,
+              right: 0,
+              child: SafeArea(child: _buildFilterRow()),
+            ),
+          if (_showTourMarkers)
+            Positioned(
+              top: 80,
+              left: 16,
+              right: 16,
+              child: SafeArea(
+                child: Material(
+                  elevation: 6,
+                  borderRadius: BorderRadius.circular(12),
+                  color: const Color(0xFF1565C0),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 8,
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.route, color: Colors.white, size: 18),
+                        const SizedBox(width: 8),
+                        const Expanded(
+                          child: Text(
+                            'Timișoara City Tour',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: _exitTour,
+                          style: TextButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            minimumSize: Size.zero,
+                          ),
+                          child: const Text(
+                            'Exit',
+                            style: TextStyle(color: Colors.white),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
           if (_navSteps.isNotEmpty)
             Positioned(
               top: 68,
@@ -331,300 +378,6 @@ class _HomePageState extends State<HomePage> {
               right: 0,
               child: LinearProgressIndicator(minHeight: 4),
             ),
-          Align(
-            alignment: Alignment.bottomCenter,
-            child: DraggableScrollableSheet(
-              expand: false,
-              initialChildSize: 0.2,
-              minChildSize: 0.1,
-              maxChildSize: 0.5,
-              builder: (context, scrollController) {
-                return Material(
-                  elevation: 10,
-                  borderRadius: const BorderRadius.vertical(
-                    top: Radius.circular(18),
-                  ),
-                  clipBehavior: Clip.antiAlias,
-                  child: Container(
-                    color: sheetColor,
-                    child: Column(
-                      children: [
-                        const SizedBox(height: 8),
-                        Container(
-                          width: 42,
-                          height: 4,
-                          decoration: BoxDecoration(
-                            color: isDark
-                                ? Colors.grey.shade700
-                                : Colors.grey.shade400,
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          'Top places',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.w600,
-                            color: titleColor,
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        Expanded(
-                          child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-                            stream: FirebaseFirestore.instance
-                                .collection('top_places')
-                                .orderBy('name')
-                                .snapshots(),
-                            builder: (context, snapshot) {
-                              if (snapshot.connectionState ==
-                                  ConnectionState.waiting) {
-                                if (_offlinePlaces.isEmpty) {
-                                  return const Center(
-                                    child: CircularProgressIndicator(),
-                                  );
-                                }
-                              }
-                              final docs = snapshot.data?.docs ?? [];
-                              final isDark =
-                                  Theme.of(context).brightness ==
-                                  Brightness.dark;
-                              final itemTitleColor = isDark
-                                  ? Colors.white
-                                  : Colors.black87;
-                              final itemSubtitleColor = isDark
-                                  ? Colors.grey.shade400
-                                  : Colors.grey.shade600;
-                              final items = <Widget>[];
-                              if (docs.isEmpty && _offlinePlaces.isEmpty) {
-                                items.add(
-                                  const Padding(
-                                    padding: EdgeInsets.symmetric(vertical: 16),
-                                    child: Center(
-                                      child: Text('No places yet.'),
-                                    ),
-                                  ),
-                                );
-                              } else if (docs.isNotEmpty) {
-                                for (final doc in docs) {
-                                  final data = doc.data();
-                                  final name = data['name']?.toString() ?? '';
-                                  final subtitle =
-                                      data['subtitle']?.toString() ?? '';
-                                  final description =
-                                      data['description']?.toString() ??
-                                      subtitle;
-                                  final lat = data['lat'] is num
-                                      ? (data['lat'] as num).toDouble()
-                                      : null;
-                                  final lng = data['lng'] is num
-                                      ? (data['lng'] as num).toDouble()
-                                      : null;
-                                  final imageUrl =
-                                      data['imageUrl']?.toString() ?? '';
-                                  final cachedUrl =
-                                      _placePhotoUrls[doc.id] ?? '';
-                                  final resolvedImageUrl = cachedUrl.isNotEmpty
-                                      ? cachedUrl
-                                      : imageUrl;
-                                  _ensurePlacePhoto(doc.id, name, lat, lng);
-                                  items.add(
-                                    Padding(
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 12,
-                                        vertical: 6,
-                                      ),
-                                      child: Row(
-                                        children: [
-                                          Expanded(
-                                            child: InkWell(
-                                              borderRadius:
-                                                  BorderRadius.circular(12),
-                                              onTap: () => _showPlaceDetails(
-                                                placeId: doc.id,
-                                                name: name,
-                                                subtitle: subtitle,
-                                                description: description,
-                                                imageUrl: resolvedImageUrl,
-                                                lat: lat,
-                                                lng: lng,
-                                              ),
-                                              child: Row(
-                                                children: [
-                                                  _buildThumbnail(
-                                                    resolvedImageUrl,
-                                                    name,
-                                                  ),
-                                                  const SizedBox(width: 12),
-                                                  Expanded(
-                                                    child: Column(
-                                                      crossAxisAlignment:
-                                                          CrossAxisAlignment
-                                                              .start,
-                                                      children: [
-                                                        Text(
-                                                          name.isEmpty
-                                                              ? 'Unknown place'
-                                                              : name,
-                                                          style: TextStyle(
-                                                            fontWeight:
-                                                                FontWeight.w600,
-                                                            color:
-                                                                itemTitleColor,
-                                                          ),
-                                                        ),
-                                                        if (subtitle.isNotEmpty)
-                                                          Text(
-                                                            subtitle,
-                                                            style: TextStyle(
-                                                              color:
-                                                                  itemSubtitleColor,
-                                                            ),
-                                                          ),
-                                                      ],
-                                                    ),
-                                                  ),
-                                                ],
-                                              ),
-                                            ),
-                                          ),
-                                          IconButton(
-                                            icon: const Icon(Icons.navigation),
-                                            color: itemTitleColor,
-                                            tooltip: 'Navigate',
-                                            onPressed: () {
-                                              if (lat == null || lng == null) {
-                                                _showSnack(
-                                                  'Missing location for $name.',
-                                                );
-                                                return;
-                                              }
-                                              _startNavigation(
-                                                LatLng(lat, lng),
-                                              );
-                                            },
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  );
-                                }
-                              } else {
-                                for (final place in _offlinePlaces) {
-                                  final name = place.name;
-                                  final subtitle = place.subtitle;
-                                  final description = place.description.isEmpty
-                                      ? subtitle
-                                      : place.description;
-                                  final resolvedImageUrl =
-                                      _placePhotoUrls[place.id] ??
-                                      place.imageUrl;
-                                  _ensurePlacePhoto(
-                                    place.id,
-                                    name,
-                                    place.lat,
-                                    place.lng,
-                                  );
-                                  items.add(
-                                    Padding(
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 12,
-                                        vertical: 6,
-                                      ),
-                                      child: Row(
-                                        children: [
-                                          Expanded(
-                                            child: InkWell(
-                                              borderRadius:
-                                                  BorderRadius.circular(12),
-                                              onTap: () => _showPlaceDetails(
-                                                placeId: place.id,
-                                                name: name,
-                                                subtitle: subtitle,
-                                                description: description,
-                                                imageUrl: resolvedImageUrl,
-                                                lat: place.lat,
-                                                lng: place.lng,
-                                              ),
-                                              child: Row(
-                                                children: [
-                                                  _buildThumbnail(
-                                                    resolvedImageUrl,
-                                                    name,
-                                                  ),
-                                                  const SizedBox(width: 12),
-                                                  Expanded(
-                                                    child: Column(
-                                                      crossAxisAlignment:
-                                                          CrossAxisAlignment
-                                                              .start,
-                                                      children: [
-                                                        Text(
-                                                          name.isEmpty
-                                                              ? 'Unknown place'
-                                                              : name,
-                                                          style: TextStyle(
-                                                            fontWeight:
-                                                                FontWeight.w600,
-                                                            color:
-                                                                itemTitleColor,
-                                                          ),
-                                                        ),
-                                                        if (subtitle.isNotEmpty)
-                                                          Text(
-                                                            subtitle,
-                                                            style: TextStyle(
-                                                              color:
-                                                                  itemSubtitleColor,
-                                                            ),
-                                                          ),
-                                                      ],
-                                                    ),
-                                                  ),
-                                                ],
-                                              ),
-                                            ),
-                                          ),
-                                          IconButton(
-                                            icon: const Icon(Icons.navigation),
-                                            color: itemTitleColor,
-                                            tooltip: 'Navigate',
-                                            onPressed: () {
-                                              if (place.lat == null ||
-                                                  place.lng == null) {
-                                                _showSnack(
-                                                  'Missing location for $name.',
-                                                );
-                                                return;
-                                              }
-                                              _startNavigation(
-                                                LatLng(place.lat!, place.lng!),
-                                              );
-                                            },
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  );
-                                }
-                              }
-                              return ListView.builder(
-                                controller: scrollController,
-                                itemCount: items.length,
-                                itemBuilder: (context, index) {
-                                  return items[index];
-                                },
-                              );
-                            },
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
         ],
       ),
       bottomNavigationBar: AppBottomNav(
@@ -633,6 +386,7 @@ class _HomePageState extends State<HomePage> {
         onOffline: () => _openPage(const OfflineToursPage()),
         onCamera: _openCamera,
         onFavorites: () => _openPage(const FavoritePlacesPage()),
+        onAiAssistant: () => _openPage(const AiAssistantPage()),
       ),
     );
   }
@@ -648,31 +402,7 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
-    final normalized = query.toLowerCase();
-    Marker? match;
-    for (final marker in _sampleMarkers) {
-      final title = marker.infoWindow.title?.toLowerCase() ?? '';
-      if (title.contains(normalized)) {
-        match = marker;
-        break;
-      }
-    }
-
-    if (match == null) {
-      _showSnack('No matching place found.');
-      return;
-    }
-
-    _mapController?.animateCamera(
-      CameraUpdate.newLatLngZoom(match.position, 15),
-    );
-    _showSnack('Moved to ${match.infoWindow.title}.');
-  }
-
-  Set<Marker> _markersWithNavigationTap() {
-    return _sampleMarkers
-        .map((m) => m.copyWith(onTapParam: () => _startNavigation(m.position)))
-        .toSet();
+    _showSnack('No matching place found.');
   }
 
   Set<Marker> _markersFromPlaces(
@@ -687,12 +417,25 @@ class _HomePageState extends State<HomePage> {
       if (name == null || name.isEmpty || lat == null || lng == null) {
         continue;
       }
+      final subtitle = data['subtitle']?.toString() ?? '';
+      final description = data['description']?.toString() ?? subtitle;
+      final imageUrl = _placePhotoUrls[doc.id] ??
+          data['imageUrl']?.toString() ?? '';
+      _ensurePlacePhoto(doc.id, name, lat, lng);
       markers.add(
         Marker(
           markerId: MarkerId(doc.id),
           position: LatLng(lat, lng),
           infoWindow: InfoWindow(title: name),
-          onTap: () => _startNavigation(LatLng(lat, lng)),
+          onTap: () => _showPlaceDetails(
+            placeId: doc.id,
+            name: name,
+            subtitle: subtitle,
+            description: description,
+            imageUrl: imageUrl,
+            lat: lat,
+            lng: lng,
+          ),
         ),
       );
     }
@@ -705,12 +448,24 @@ class _HomePageState extends State<HomePage> {
       if (place.name.isEmpty || place.lat == null || place.lng == null) {
         continue;
       }
+      final imageUrl = _placePhotoUrls[place.id] ?? place.imageUrl;
+      _ensurePlacePhoto(place.id, place.name, place.lat, place.lng);
       markers.add(
         Marker(
           markerId: MarkerId(place.id),
           position: LatLng(place.lat!, place.lng!),
           infoWindow: InfoWindow(title: place.name),
-          onTap: () => _startNavigation(LatLng(place.lat!, place.lng!)),
+          onTap: () => _showPlaceDetails(
+            placeId: place.id,
+            name: place.name,
+            subtitle: place.subtitle,
+            description: place.description.isEmpty
+                ? place.subtitle
+                : place.description,
+            imageUrl: imageUrl,
+            lat: place.lat,
+            lng: place.lng,
+          ),
         ),
       );
     }
@@ -1189,12 +944,23 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _openCamera() async {
     try {
-      final picked = await _picker.pickImage(source: ImageSource.camera);
+      final picked = await _picker.pickImage(
+        source: ImageSource.camera,
+        imageQuality: 85,
+        maxWidth: 1600,
+        maxHeight: 1600,
+      );
       if (picked == null) return; // user canceled
+      final saved = await _persistPickedPhoto(
+        picked: picked,
+        filenamePrefix: 'capture',
+      );
       setState(() {
-        _lastCapturedPhoto = picked;
+        _lastCapturedPhoto = XFile(saved.path);
       });
-      _showSnack('Photo captured: ${picked.name}');
+      _showSnack(
+        'Photo saved: ${saved.path.split(Platform.pathSeparator).last}',
+      );
     } catch (_) {
       _showSnack('Could not open camera.');
     }
@@ -1415,11 +1181,10 @@ class _HomePageState extends State<HomePage> {
         maxHeight: 1280,
       );
       if (picked == null) return null;
-      final dir = await getApplicationDocumentsDirectory();
-      final target = File(
-        '${dir.path}/memory_${placeId}_${DateTime.now().millisecondsSinceEpoch}.jpg',
+      final saved = await _persistPickedPhoto(
+        picked: picked,
+        filenamePrefix: 'memory_$placeId',
       );
-      final saved = await File(picked.path).copy(target.path);
       try {} catch (_) {
         // Ignore gallery save errors; local save still succeeds.
       }
@@ -1432,6 +1197,17 @@ class _HomePageState extends State<HomePage> {
       _showSnack('Could not save memory photo.');
       return null;
     }
+  }
+
+  Future<File> _persistPickedPhoto({
+    required XFile picked,
+    required String filenamePrefix,
+  }) async {
+    final dir = await getApplicationDocumentsDirectory();
+    final target = File(
+      '${dir.path}/${filenamePrefix}_${DateTime.now().millisecondsSinceEpoch}.jpg',
+    );
+    return File(picked.path).copy(target.path);
   }
 
   Future<void> _incrementVisitedCount() async {
@@ -1644,47 +1420,6 @@ class _HomePageState extends State<HomePage> {
         '?maxwidth=400&photoreference=$reference&key=$_placesApiKey';
   }
 
-  Widget _buildThumbnail(
-    String imageUrl,
-    String name, {
-    String localPath = '',
-  }) {
-    final placeholder = Container(
-      width: 52,
-      height: 52,
-      decoration: BoxDecoration(
-        color: Colors.grey.shade200,
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: const Icon(Icons.photo, color: Colors.black45),
-    );
-    if (localPath.isNotEmpty) {
-      return ClipRRect(
-        borderRadius: BorderRadius.circular(10),
-        child: Image.file(
-          File(localPath),
-          width: 52,
-          height: 52,
-          fit: BoxFit.cover,
-          // ignore: unnecessary_underscores
-          errorBuilder: (_, __, ___) => placeholder,
-        ),
-      );
-    }
-    if (imageUrl.isEmpty) return placeholder;
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(10),
-      child: Image.network(
-        imageUrl,
-        width: 52,
-        height: 52,
-        fit: BoxFit.cover,
-        // ignore: unnecessary_underscores
-        errorBuilder: (_, __, ___) => placeholder,
-      ),
-    );
-  }
-
   void _showPlaceDetails({
     required String placeId,
     required String name,
@@ -1853,6 +1588,157 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  Widget _buildFilterRow() {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Row(
+        children: _categoryFilters.map((filter) {
+          final isActive = _activeCategory == filter.type;
+          return Padding(
+            padding: const EdgeInsets.only(right: 8),
+            child: FilterChip(
+              avatar: Icon(
+                filter.icon,
+                size: 16,
+                color: isActive ? Colors.white : filter.color,
+              ),
+              label: Text(
+                filter.label,
+                style: TextStyle(
+                  color: isActive ? Colors.white : null,
+                  fontWeight: isActive ? FontWeight.w600 : null,
+                ),
+              ),
+              selected: isActive,
+              selectedColor: filter.color,
+              backgroundColor: isDark ? Colors.grey.shade800 : Colors.white,
+              elevation: 3,
+              onSelected: (selected) {
+                if (selected) {
+                  setState(() {
+                    _activeCategory = filter.type;
+                    _categoryMarkers = {};
+                  });
+                  _fetchCategoryPlaces(filter.type);
+                } else {
+                  setState(() {
+                    _activeCategory = null;
+                    _categoryMarkers = {};
+                  });
+                }
+              },
+            ),
+          );
+        }).toList(),
+      ),
+    );
+  }
+
+  static const _categoryExcludedTypes = <String, Set<String>>{
+    'restaurant': {'gas_station', 'fuel', 'lodging', 'convenience_store'},
+    'museum': {'restaurant', 'lodging', 'gas_station'},
+    'park': {'restaurant', 'lodging', 'gas_station'},
+    'lodging': {'gas_station', 'fuel', 'restaurant'},
+  };
+
+  Future<void> _fetchCategoryPlaces(String type) async {
+    if (_placesApiKey.isEmpty) return;
+    if (!mounted) return;
+    double lat = 45.7489, lng = 21.2087;
+    try {
+      final pos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+        ),
+      );
+      lat = pos.latitude;
+      lng = pos.longitude;
+    } catch (_) {}
+
+    try {
+      final url = Uri.parse(
+        'https://maps.googleapis.com/maps/api/place/nearbysearch/json'
+        '?location=$lat,$lng'
+        '&radius=5000'
+        '&type=$type'
+        '&rankby=prominence'
+        '&key=$_placesApiKey',
+      );
+      final response = await http.get(url);
+      if (response.statusCode != 200 || !mounted) return;
+
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final results = data['results'] as List<dynamic>? ?? [];
+      final excluded = _categoryExcludedTypes[type] ?? const {};
+      final markers = <Marker>{};
+
+      for (final item in results) {
+        final place = item as Map<String, dynamic>;
+        final placeId = place['place_id']?.toString();
+        final name = place['name']?.toString();
+        final location =
+            (place['geometry'] as Map<String, dynamic>?)?['location']
+                as Map<String, dynamic>?;
+        final pLat = location?['lat'] as num?;
+        final pLng = location?['lng'] as num?;
+        if (placeId == null || name == null || pLat == null || pLng == null) {
+          continue;
+        }
+
+        // Skip places whose types overlap with the exclusion list for this category.
+        final placeTypes =
+            (place['types'] as List<dynamic>?)?.cast<String>().toSet() ??
+            const <String>{};
+        if (placeTypes.intersection(excluded).isNotEmpty) continue;
+
+        markers.add(
+          Marker(
+            markerId: MarkerId('cat_$placeId'),
+            position: LatLng(pLat.toDouble(), pLng.toDouble()),
+            infoWindow: InfoWindow(title: name),
+            icon: BitmapDescriptor.defaultMarkerWithHue(_categoryHue(type)),
+            onTap: () => _showNearbyPlaceDetails(
+              _NearbyPlace(
+                id: placeId,
+                name: name,
+                position: LatLng(pLat.toDouble(), pLng.toDouble()),
+              ),
+            ),
+          ),
+        );
+      }
+
+      if (!mounted) return;
+      setState(() => _categoryMarkers = markers);
+      if (markers.isNotEmpty) {
+        _mapController?.animateCamera(
+          CameraUpdate.newLatLngZoom(LatLng(lat, lng), 14),
+        );
+      } else {
+        _showSnack('No ${type}s found nearby.');
+      }
+    } catch (_) {
+      if (mounted) _showSnack('Could not load places.');
+    }
+  }
+
+  double _categoryHue(String type) {
+    switch (type) {
+      case 'restaurant':
+        return BitmapDescriptor.hueOrange;
+      case 'museum':
+        return BitmapDescriptor.hueViolet;
+      case 'park':
+        return BitmapDescriptor.hueGreen;
+      case 'lodging':
+        return BitmapDescriptor.hueAzure;
+      default:
+        return BitmapDescriptor.hueRed;
+    }
+  }
+
   Future<void> _seedTopPlacesIfEmpty() async {
     try {
       final collection = FirebaseFirestore.instance.collection('top_places');
@@ -1963,11 +1849,179 @@ class _HomePageState extends State<HomePage> {
         _offlinePlaces = places;
         _tourMarkers = _markersFromOffline(places);
       });
+      if (widget.showTour) _activateTour();
     } catch (_) {
       // Ignore invalid offline data.
     }
   }
+
+  void _activateTour() {
+    if (_offlinePlaces.isEmpty) return;
+    final sorted = [..._offlinePlaces]
+      ..sort((a, b) => a.order.compareTo(b.order));
+    final points = sorted
+        .where((p) => p.lat != null && p.lng != null)
+        .map((p) => LatLng(p.lat!, p.lng!))
+        .toList();
+    if (points.isEmpty) return;
+
+    final tourMarkers = _buildTourMarkersFromOffline(sorted);
+    final polyline = Polyline(
+      polylineId: const PolylineId('tour_route'),
+      points: points,
+      color: const Color(0xFF1565C0),
+      width: 4,
+      patterns: [PatternItem.dash(20), PatternItem.gap(10)],
+    );
+
+    setState(() {
+      _showTourMarkers = true;
+      _tourMarkers = tourMarkers;
+      _tourPolylines = {polyline};
+    });
+
+    if (points.length > 1) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _mapController == null) return;
+        _mapController!.animateCamera(
+          CameraUpdate.newLatLngBounds(_latLngBounds(points), 60),
+        );
+      });
+    }
+  }
+
+  void _exitTour() {
+    setState(() {
+      _showTourMarkers = false;
+      _tourPolylines = {};
+    });
+  }
+
+  LatLngBounds _latLngBounds(List<LatLng> points) {
+    var minLat = points.first.latitude;
+    var maxLat = points.first.latitude;
+    var minLng = points.first.longitude;
+    var maxLng = points.first.longitude;
+    for (final p in points) {
+      if (p.latitude < minLat) minLat = p.latitude;
+      if (p.latitude > maxLat) maxLat = p.latitude;
+      if (p.longitude < minLng) minLng = p.longitude;
+      if (p.longitude > maxLng) maxLng = p.longitude;
+    }
+    return LatLngBounds(
+      southwest: LatLng(minLat, minLng),
+      northeast: LatLng(maxLat, maxLng),
+    );
+  }
+
+  Set<Marker> _buildTourMarkersFromOffline(List<_OfflinePlace> sorted) {
+    final valid = sorted.where((p) => p.lat != null && p.lng != null).toList();
+    return valid.asMap().entries.map((e) {
+      final p = e.value;
+      final displayOrder = p.order > 0 ? p.order : e.key + 1;
+      return Marker(
+        markerId: MarkerId('tour_${p.id}'),
+        position: LatLng(p.lat!, p.lng!),
+        infoWindow: InfoWindow(
+          title: '$displayOrder. ${p.name}',
+          snippet: p.subtitle,
+        ),
+        icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueBlue),
+        onTap: () => _showTourStopDetail(p),
+      );
+    }).toSet();
+  }
+
+  void _showTourStopDetail(_OfflinePlace place) {
+    showModalBottomSheet<void>(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) => Padding(
+        padding: EdgeInsets.fromLTRB(
+          20,
+          20,
+          20,
+          20 + MediaQuery.of(ctx).padding.bottom,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Stop ${place.order}: ${place.name}',
+              style: Theme.of(
+                ctx,
+              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+            ),
+            if (place.subtitle.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text(place.subtitle, style: const TextStyle(color: Colors.grey)),
+            ],
+            if (place.description.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(place.description),
+            ],
+            const SizedBox(height: 16),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                icon: const Icon(Icons.navigation),
+                label: const Text('Navigate here'),
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  _startNavigation(LatLng(place.lat!, place.lng!));
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
+
+class _CategoryFilter {
+  const _CategoryFilter({
+    required this.label,
+    required this.type,
+    required this.icon,
+    required this.color,
+  });
+
+  final String label;
+  final String type;
+  final IconData icon;
+  final Color color;
+}
+
+const _categoryFilters = [
+  _CategoryFilter(
+    label: 'Restaurant',
+    type: 'restaurant',
+    icon: Icons.restaurant,
+    color: Colors.orange,
+  ),
+  _CategoryFilter(
+    label: 'Muzeu',
+    type: 'museum',
+    icon: Icons.museum_outlined,
+    color: Colors.purple,
+  ),
+  _CategoryFilter(
+    label: 'Parc',
+    type: 'park',
+    icon: Icons.park_outlined,
+    color: Colors.green,
+  ),
+  _CategoryFilter(
+    label: 'Hotel',
+    type: 'lodging',
+    icon: Icons.hotel_outlined,
+    color: Colors.blue,
+  ),
+];
 
 class _NearbyPlace {
   const _NearbyPlace({

@@ -1,17 +1,106 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../widgets/app_bottom_nav.dart';
+import 'ai_assistant_page.dart';
 import 'home_page.dart';
 import 'offline_tours_page.dart';
 import 'profile_page.dart';
 
-class FavoritePlacesPage extends StatelessWidget {
+class FavoritePlacesPage extends StatefulWidget {
   const FavoritePlacesPage({super.key});
+
+  @override
+  State<FavoritePlacesPage> createState() => _FavoritePlacesPageState();
+}
+
+class _FavoritePlacesPageState extends State<FavoritePlacesPage> {
+  static const MethodChannel _platformKeys = MethodChannel(
+    'com.example.see_the_world/keys',
+  );
+
+  String _placesApiKey = '';
+  final Map<String, String> _freshPhotoUrls = {};
+  final Set<String> _refreshing = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPlacesApiKey();
+  }
+
+  Future<void> _loadPlacesApiKey() async {
+    try {
+      final key = await _platformKeys.invokeMethod<String>('getPlacesApiKey');
+      if (key != null && key.isNotEmpty && mounted) {
+        setState(() => _placesApiKey = key);
+      }
+    } catch (_) {}
+  }
+
+  // Only URLs with photo_reference can expire; static Wikipedia/storage URLs don't.
+  bool _needsRefresh(String imageUrl) =>
+      imageUrl.contains('photo_reference') &&
+      imageUrl.contains('maps.googleapis.com');
+
+  Future<void> _refreshPhotoUrl(String placeId, String currentUrl) async {
+    if (_placesApiKey.isEmpty) return;
+    if (_freshPhotoUrls.containsKey(placeId)) return;
+    if (_refreshing.contains(placeId)) return;
+    _refreshing.add(placeId);
+
+    try {
+      final detailsUrl = Uri.parse(
+        'https://maps.googleapis.com/maps/api/place/details/json'
+        '?place_id=$placeId'
+        '&fields=photos'
+        '&key=$_placesApiKey',
+      );
+      final response = await http.get(detailsUrl);
+      if (response.statusCode != 200) return;
+
+      final body = jsonDecode(response.body) as Map<String, dynamic>;
+      if (body['status'] != 'OK') return;
+
+      final photos =
+          (body['result'] as Map<String, dynamic>?)?['photos'] as List?;
+      if (photos == null || photos.isEmpty) return;
+
+      final ref =
+          (photos.first as Map<String, dynamic>)['photo_reference']
+              ?.toString();
+      if (ref == null || ref.isEmpty) return;
+
+      final freshUrl =
+          'https://maps.googleapis.com/maps/api/place/photo'
+          '?maxwidth=800&photoreference=$ref&key=$_placesApiKey';
+
+      if (!mounted) return;
+      setState(() => _freshPhotoUrls[placeId] = freshUrl);
+
+      // Persist fresh URL in Firestore so the next app launch uses it directly.
+      final user = FirebaseAuth.instance.currentUser;
+      if (user != null) {
+        await FirebaseFirestore.instance
+            .collection('users')
+            .doc(user.uid)
+            .collection('favorites')
+            .doc(placeId)
+            .update({'imageUrl': freshUrl});
+      }
+    } catch (_) {
+      // Ignore errors; placeholder is shown until the next successful refresh.
+    } finally {
+      _refreshing.remove(placeId);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -42,13 +131,24 @@ class FavoritePlacesPage extends StatelessWidget {
                   separatorBuilder: (_, __) => const Divider(height: 16),
                   itemBuilder: (context, index) {
                     final data = docs[index].data();
-                    final name = data['name']?.toString() ?? 'Unknown place';
+                    final name =
+                        data['name']?.toString() ?? 'Unknown place';
                     final subtitle = data['subtitle']?.toString() ?? '';
-                    final imageUrl = data['imageUrl']?.toString() ?? '';
+                    final storedUrl = data['imageUrl']?.toString() ?? '';
                     final docId = docs[index].id;
                     final memoryPhotoUrl =
                         data['memoryPhotoUrl']?.toString() ?? '';
-                    final content = InkWell(
+
+                    // Prefer freshly fetched URL; fall back to stored URL.
+                    final imageUrl = _freshPhotoUrls[docId] ?? storedUrl;
+
+                    // Trigger a background refresh for expired photo_reference URLs.
+                    if (_needsRefresh(storedUrl) &&
+                        !_freshPhotoUrls.containsKey(docId)) {
+                      _refreshPhotoUrl(docId, storedUrl);
+                    }
+
+                    return InkWell(
                       onTap: () => _showFavoriteDetails(
                         context: context,
                         placeId: docId,
@@ -99,7 +199,6 @@ class FavoritePlacesPage extends StatelessWidget {
                         ],
                       ),
                     );
-                    return content;
                   },
                 );
               },
@@ -122,6 +221,11 @@ class FavoritePlacesPage extends StatelessWidget {
           );
         },
         onFavorites: () {},
+        onAiAssistant: () {
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(builder: (_) => const AiAssistantPage()),
+          );
+        },
       ),
     );
   }
@@ -337,16 +441,33 @@ void _showFullImage(BuildContext context, String memoryPath, String imageUrl) {
   if (memoryPath.isEmpty && imageUrl.isEmpty) return;
   showDialog<void>(
     context: context,
+    barrierColor: Colors.black87,
     builder: (context) {
       final image = memoryPath.isNotEmpty
           ? Image.file(File(memoryPath), fit: BoxFit.contain)
           : Image.network(imageUrl, fit: BoxFit.contain);
-      return Dialog(
-        insetPadding: const EdgeInsets.all(12),
-        child: InteractiveViewer(
-          minScale: 0.8,
-          maxScale: 4,
-          child: AspectRatio(aspectRatio: 1, child: Center(child: image)),
+      return Dialog.fullscreen(
+        backgroundColor: Colors.black,
+        child: Stack(
+          children: [
+            Center(
+              child: InteractiveViewer(
+                minScale: 0.8,
+                maxScale: 4,
+                child: image,
+              ),
+            ),
+            Positioned(
+              top: 0,
+              right: 0,
+              child: SafeArea(
+                child: IconButton(
+                  icon: const Icon(Icons.close, color: Colors.white),
+                  onPressed: () => Navigator.of(context).pop(),
+                ),
+              ),
+            ),
+          ],
         ),
       );
     },

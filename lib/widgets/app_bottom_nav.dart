@@ -8,6 +8,7 @@ class AppBottomNav extends StatelessWidget {
     required this.onOffline,
     required this.onCamera,
     required this.onFavorites,
+    required this.onAiAssistant,
   });
 
   final int currentIndex;
@@ -15,6 +16,7 @@ class AppBottomNav extends StatelessWidget {
   final VoidCallback onOffline;
   final VoidCallback onCamera;
   final VoidCallback onFavorites;
+  final VoidCallback onAiAssistant;
 
   @override
   Widget build(BuildContext context) {
@@ -73,6 +75,16 @@ class AppBottomNav extends StatelessWidget {
                 baseColor: baseColor,
                 selectedColor: selectedColor,
                 onTap: onFavorites,
+              ),
+            ),
+            Expanded(
+              child: _NavButton(
+                icon: Icons.smart_toy_outlined,
+                label: 'AI',
+                isSelected: currentIndex == 4,
+                baseColor: baseColor,
+                selectedColor: selectedColor,
+                onTap: onAiAssistant,
               ),
             ),
           ],

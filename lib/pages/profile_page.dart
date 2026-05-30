@@ -8,6 +8,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../widgets/app_bottom_nav.dart';
+import 'ai_assistant_page.dart';
 import 'favorite_places_page.dart';
 import 'home_page.dart';
 import 'offline_tours_page.dart';
@@ -125,6 +126,11 @@ class _ProfilePageState extends State<ProfilePage> {
             MaterialPageRoute(builder: (_) => const FavoritePlacesPage()),
           );
         },
+        onAiAssistant: () {
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(builder: (_) => const AiAssistantPage()),
+          );
+        },
       ),
     );
   }
@@ -223,7 +229,7 @@ class _ProfilePageState extends State<ProfilePage> {
                   width: 56,
                   height: 56,
                   decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(0.4),
+                    color: Colors.black.withValues(alpha: 0.4),
                     shape: BoxShape.circle,
                   ),
                   child: const Center(
@@ -317,6 +323,7 @@ class _ProfilePageState extends State<ProfilePage> {
     try {
       final picked = await _picker.pickImage(source: ImageSource.gallery);
       if (picked == null) return;
+      if (!mounted) return;
       setState(() => _isUploadingPhoto = true);
       final ref = FirebaseStorage.instance
           .ref()
@@ -334,9 +341,13 @@ class _ProfilePageState extends State<ProfilePage> {
       setState(() {});
       _showSnack('Profile photo updated.');
     } on FirebaseException catch (e) {
-      _showSnack(e.message ?? 'Could not update profile photo.');
+      if (mounted) {
+        _showSnack(e.message ?? 'Could not update profile photo.');
+      }
     } catch (_) {
-      _showSnack('Could not update profile photo.');
+      if (mounted) {
+        _showSnack('Could not update profile photo.');
+      }
     } finally {
       if (mounted) {
         setState(() => _isUploadingPhoto = false);
@@ -398,6 +409,7 @@ class _ProfilePageState extends State<ProfilePage> {
         );
       },
     );
+    if (!mounted) return;
     if (confirmed != true) return;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt(_visitedCountKey, 0);

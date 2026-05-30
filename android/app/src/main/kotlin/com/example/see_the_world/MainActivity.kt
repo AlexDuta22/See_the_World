@@ -1,6 +1,5 @@
 package com.example.see_the_world
 
-import android.os.Bundle
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -20,7 +19,7 @@ class MainActivity : FlutterActivity() {
                             packageName
                         )
                         if (resId != 0) {
-                            result.success(getString(resId))
+                            result.success(resources.getString(resId))
                         } else {
                             result.success("")
                         }

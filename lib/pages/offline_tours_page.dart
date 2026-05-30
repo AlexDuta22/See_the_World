@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../widgets/app_bottom_nav.dart';
+import 'ai_assistant_page.dart';
 import 'favorite_places_page.dart';
 import 'home_page.dart';
 import 'profile_page.dart';
@@ -16,7 +17,7 @@ class OfflineToursPage extends StatefulWidget {
 }
 
 class _OfflineToursPageState extends State<OfflineToursPage> {
-  static const String _timisoaraTourKey = 'offline_tour_timisoara';
+  static const String _timisoaraTourKey = 'offline_tour_timisoara_v2';
   bool _isDownloading = false;
   bool _isDownloaded = false;
 
@@ -164,12 +165,20 @@ class _OfflineToursPageState extends State<OfflineToursPage> {
             elevation: 2,
             borderRadius: BorderRadius.circular(12),
             child: ListTile(
+              leading: const Icon(Icons.route, color: Color(0xFF1565C0)),
               title: const Text('Timi\u015foara City Tour'),
               subtitle: Text(
                 _isDownloaded
-                    ? 'Ready for offline use.'
+                    ? 'Tap to explore on map \u00b7 8 stops'
                     : 'Download 8 stops for offline access.',
               ),
+              onTap: _isDownloaded
+                  ? () => Navigator.of(context).pushReplacement(
+                        MaterialPageRoute(
+                          builder: (_) => const HomePage(showTour: true),
+                        ),
+                      )
+                  : null,
               trailing: _isDownloading
                   ? const SizedBox(
                       width: 22,
@@ -179,12 +188,18 @@ class _OfflineToursPageState extends State<OfflineToursPage> {
                   : IconButton(
                       icon: Icon(
                         _isDownloaded
-                            ? Icons.check_circle
+                            ? Icons.map_outlined
                             : Icons.download,
                       ),
-                      tooltip: _isDownloaded ? 'Downloaded' : 'Download',
-                      onPressed:
-                          _isDownloaded ? null : _downloadTimisoaraTour,
+                      tooltip: _isDownloaded ? 'Open tour' : 'Download',
+                      onPressed: _isDownloaded
+                          ? () => Navigator.of(context).pushReplacement(
+                                MaterialPageRoute(
+                                  builder: (_) =>
+                                      const HomePage(showTour: true),
+                                ),
+                              )
+                          : _downloadTimisoaraTour,
                     ),
             ),
           ),
@@ -206,6 +221,11 @@ class _OfflineToursPageState extends State<OfflineToursPage> {
         onFavorites: () {
           Navigator.of(context).pushReplacement(
             MaterialPageRoute(builder: (_) => const FavoritePlacesPage()),
+          );
+        },
+        onAiAssistant: () {
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(builder: (_) => const AiAssistantPage()),
           );
         },
       ),
