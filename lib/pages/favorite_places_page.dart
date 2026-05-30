@@ -45,10 +45,10 @@ class _FavoritePlacesPageState extends State<FavoritePlacesPage> {
     } catch (_) {}
   }
 
-  // Only URLs with photo_reference can expire; static Wikipedia/storage URLs don't.
+  // Only Google Places photo URLs can expire (key rotation or stale photo
+  // reference); static Wikipedia/storage URLs don't.
   bool _needsRefresh(String imageUrl) =>
-      imageUrl.contains('photo_reference') &&
-      imageUrl.contains('maps.googleapis.com');
+      imageUrl.contains('maps.googleapis.com/maps/api/place/photo');
 
   Future<void> _refreshPhotoUrl(String placeId, String currentUrl) async {
     if (_placesApiKey.isEmpty) return;
