@@ -1,7 +1,8 @@
-import 'dart:convert';
-
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 
@@ -24,18 +25,12 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   bool _speechAvailable = false;
   bool _ttsEnabled = false;
   bool _english = false;
-  final String _apiKey = _defaultApiKey;
   String _partialText = '';
 
-  // Cheia Gemini NU se pune în cod. Se furnizează la build dintr-un fișier
-  // gitignored:
-  //   flutter run --dart-define-from-file=dart_defines.json
-  // Vezi dart_defines.example.json pentru format.
-  static const String _defaultApiKey = String.fromEnvironment(
-    'GEMINI_API_KEY',
-  );
-
-  static const String _model = 'gemini-2.5-flash';
+  // Cheia Gemini NU mai există în client. Stă exclusiv pe server, ca secret
+  // Firebase, iar apelul trece printr-o Cloud Function autentificată
+  // (askGemini). Astfel cheia nu poate fi extrasă din APK sau din trafic.
+  static const String _functionsRegion = 'europe-west1';
 
   static const String _systemPromptRo =
       'Ești un asistent de călătorie specializat în România și Europa. '
@@ -136,7 +131,7 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       await _speech.stop();
       setState(() => _isListening = false);
       if (_partialText.trim().isNotEmpty) {
-        final text = _partialText.trim();
+         final text = _partialText.trim();
         _partialText = '';
         await _sendMessage(text);
       }
@@ -178,9 +173,15 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   Future<void> _sendMessage(String text) async {
     final trimmed = text.trim();
     if (trimmed.isEmpty) return;
-    if (_apiKey.isEmpty) {
+    if (FirebaseAuth.instance.currentUser == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Cheia API Gemini nu este configurată.')),
+        SnackBar(
+          content: Text(
+            _english
+                ? 'Sign in to use the assistant.'
+                : 'Autentifică-te ca să folosești asistentul.',
+          ),
+        ),
       );
       return;
     }
@@ -212,6 +213,82 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     _scrollToBottom();
   }
 
+  // Citește datele personale ale utilizatorului din Firestore (locuri favorite)
+  // și contorul de vizite, ca să le injecteze în prompt. Astfel recomandările
+  // sunt personalizate și asistentul nu mai e izolat de restul aplicației.
+  static const String _visitedCountKey = 'visited_places_count';
+
+  Future<String> _buildUserContext() async {
+    final favorites = <String>[];
+    final user = FirebaseAuth.instance.currentUser;
+    if (user != null) {
+      try {
+        final snapshot = await FirebaseFirestore.instance
+            .collection('users')
+            .doc(user.uid)
+            .collection('favorites')
+            .orderBy('updatedAt', descending: true)
+            .limit(30)
+            .get();
+        for (final doc in snapshot.docs) {
+          final data = doc.data();
+          final name = data['name']?.toString().trim() ?? '';
+          if (name.isEmpty) continue;
+          final subtitle = data['subtitle']?.toString().trim() ?? '';
+          favorites.add(subtitle.isEmpty ? name : '$name ($subtitle)');
+        }
+      } catch (_) {
+        // Fără context personalizat dacă citirea eșuează; asistentul rămâne funcțional.
+      }
+    }
+
+    int visitedCount = 0;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      visitedCount = prefs.getInt(_visitedCountKey) ?? 0;
+    } catch (_) {}
+
+    if (favorites.isEmpty && visitedCount == 0) return '';
+
+    final buffer = StringBuffer();
+    if (_english) {
+      buffer.write(
+        '\n\nUser personalization context — use it to tailor every recommendation:',
+      );
+      if (favorites.isNotEmpty) {
+        buffer.write(
+          '\n- Places the user already saved as favorites: ${favorites.join(", ")}. '
+          'Do NOT recommend these same places again. Instead, infer the tastes they reveal '
+          '(type of place, region, atmosphere) and suggest new destinations that match.',
+        );
+      }
+      if (visitedCount > 0) {
+        buffer.write(
+          '\n- The user has already visited $visitedCount place(s) through the app, '
+          'so prioritize fresh suggestions.',
+        );
+      }
+    } else {
+      buffer.write(
+        '\n\nContext de personalizare despre utilizator — folosește-l ca să adaptezi fiecare recomandare:',
+      );
+      if (favorites.isNotEmpty) {
+        buffer.write(
+          '\n- Locuri pe care utilizatorul le-a salvat deja la favorite: ${favorites.join(", ")}. '
+          'NU recomanda din nou aceleași locuri. În schimb, deduce preferințele pe care le arată '
+          '(tipul locului, regiunea, atmosfera) și sugerează destinații noi care se potrivesc.',
+        );
+      }
+      if (visitedCount > 0) {
+        buffer.write(
+          '\n- Utilizatorul a vizitat deja $visitedCount loc(uri) prin aplicație, '
+          'deci prioritizează sugestii noi.',
+        );
+      }
+    }
+    return buffer.toString();
+  }
+
   Future<({String? text, String? error})> _callGemini(String userText) async {
     try {
       final contents = <Map<String, dynamic>>[];
@@ -231,46 +308,30 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         ],
       });
 
-      final url = Uri.parse(
-        'https://generativelanguage.googleapis.com/v1beta/models/'
-        '$_model:generateContent?key=$_apiKey',
-      );
-      final response = await http
-          .post(
-            url,
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'system_instruction': {
-                'parts': [
-                  {'text': _systemPrompt},
-                ],
-              },
-              'contents': contents,
-              'generationConfig': {'maxOutputTokens': 1024},
-            }),
-          )
-          .timeout(const Duration(seconds: 30));
+      final systemInstruction = _systemPrompt + await _buildUserContext();
 
-      if (response.statusCode != 200) {
-        return (
-          text: null,
-          error: 'Eroare ${response.statusCode}: ${response.body}',
-        );
+      // Apelul nu mai conține cheia API. Cloud Function-ul autentificat
+      // (askGemini) o ține pe server și vorbește el cu Gemini.
+      final callable = FirebaseFunctions.instanceFor(region: _functionsRegion)
+          .httpsCallable(
+            'askGemini',
+            options: HttpsCallableOptions(timeout: const Duration(seconds: 30)),
+          );
+      final response = await callable.call<Map<String, dynamic>>({
+        'systemInstruction': systemInstruction,
+        'contents': contents,
+      });
+
+      final text = response.data['text']?.toString();
+      if (text == null || text.isEmpty) {
+        return (text: null, error: 'Răspuns gol de la asistent.');
       }
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      final candidates = data['candidates'] as List<dynamic>?;
-      if (candidates == null || candidates.isEmpty) {
-        return (text: null, error: 'Răspuns gol de la Gemini: ${response.body}');
-      }
-      final content =
-          (candidates.first as Map<String, dynamic>)['content']
-              as Map<String, dynamic>?;
-      final parts = content?['parts'] as List<dynamic>?;
-      if (parts == null || parts.isEmpty) {
-        return (text: null, error: 'Răspuns fără text: ${response.body}');
-      }
-      final text = (parts.first as Map<String, dynamic>)['text']?.toString();
       return (text: text, error: null);
+    } on FirebaseFunctionsException catch (e) {
+      // Includem și codul (not-found, unauthenticated, unavailable...) ca să fie
+      // ușor de diagnosticat. 'not-found' = funcția nu e deployată / regiune greșită.
+      final detail = e.message ?? 'fără detalii';
+      return (text: null, error: 'Eroare asistent [${e.code}]: $detail');
     } catch (e) {
       return (text: null, error: 'Excepție: $e');
     }
