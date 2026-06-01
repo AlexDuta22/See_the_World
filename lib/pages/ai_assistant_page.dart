@@ -7,7 +7,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 
@@ -33,6 +32,7 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   bool _speechAvailable = false;
   bool _ttsEnabled = false;
   bool _english = false;
+  bool _withContext = true;
   String _partialText = '';
 
   // Cheia Gemini NU mai există în client. Stă exclusiv pe server, ca secret
@@ -320,42 +320,15 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     }
   }
 
-  // Citește datele personale ale utilizatorului din Firestore (locuri favorite)
-  // și contorul de vizite, ca să le injecteze în prompt. Astfel recomandările
-  // sunt personalizate și asistentul nu mai e izolat de restul aplicației.
-  static const String _visitedCountKey = 'visited_places_count';
-
   Future<String> _buildUserContext() async {
-    final favorites = <String>[];
+    if (!_withContext) return '';
     final user = FirebaseAuth.instance.currentUser;
-    if (user != null) {
-      try {
-        final snapshot = await FirebaseFirestore.instance
-            .collection('users')
-            .doc(user.uid)
-            .collection('favorites')
-            .orderBy('updatedAt', descending: true)
-            .limit(30)
-            .get();
-        for (final doc in snapshot.docs) {
-          final data = doc.data();
-          final name = data['name']?.toString().trim() ?? '';
-          if (name.isEmpty) continue;
-          final subtitle = data['subtitle']?.toString().trim() ?? '';
-          favorites.add(subtitle.isEmpty ? name : '$name ($subtitle)');
-        }
-      } catch (_) {
-        // Fără context personalizat dacă citirea eșuează; asistentul rămâne funcțional.
-      }
-    }
+    if (user == null) return '';
 
-    int visitedCount = 0;
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      visitedCount = prefs.getInt(_visitedCountKey) ?? 0;
-    } catch (_) {}
+    final favorites = await _readPlaceNames(user.uid, 'favorites', 'updatedAt');
+    final visited = await _readPlaceNames(user.uid, 'visited', 'visitedAt');
 
-    if (favorites.isEmpty && visitedCount == 0) return '';
+    if (favorites.isEmpty && visited.isEmpty) return '';
 
     final buffer = StringBuffer();
     if (_english) {
@@ -364,15 +337,15 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       );
       if (favorites.isNotEmpty) {
         buffer.write(
-          '\n- Places the user already saved as favorites: ${favorites.join(", ")}. '
-          'Do NOT recommend these same places again. Instead, infer the tastes they reveal '
+          '\n- Places the user saved as favorites: ${favorites.join(", ")}. '
+          'Do NOT recommend these same places again; infer the tastes they reveal '
           '(type of place, region, atmosphere) and suggest new destinations that match.',
         );
       }
-      if (visitedCount > 0) {
+      if (visited.isNotEmpty) {
         buffer.write(
-          '\n- The user has already visited $visitedCount place(s) through the app, '
-          'so prioritize fresh suggestions.',
+          '\n- Places the user already visited: ${visited.join(", ")}. '
+          'Avoid recommending these again and prioritize fresh suggestions.',
         );
       }
     } else {
@@ -381,19 +354,44 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       );
       if (favorites.isNotEmpty) {
         buffer.write(
-          '\n- Locuri pe care utilizatorul le-a salvat deja la favorite: ${favorites.join(", ")}. '
-          'NU recomanda din nou aceleași locuri. În schimb, deduce preferințele pe care le arată '
+          '\n- Locuri salvate la favorite: ${favorites.join(", ")}. '
+          'NU recomanda din nou aceleași locuri; deduce preferințele pe care le arată '
           '(tipul locului, regiunea, atmosfera) și sugerează destinații noi care se potrivesc.',
         );
       }
-      if (visitedCount > 0) {
+      if (visited.isNotEmpty) {
         buffer.write(
-          '\n- Utilizatorul a vizitat deja $visitedCount loc(uri) prin aplicație, '
-          'deci prioritizează sugestii noi.',
+          '\n- Locuri deja vizitate: ${visited.join(", ")}. '
+          'Evită să le recomanzi din nou și prioritizează sugestii noi.',
         );
       }
     }
     return buffer.toString();
+  }
+
+  Future<List<String>> _readPlaceNames(
+    String uid,
+    String collection,
+    String orderField,
+  ) async {
+    final names = <String>[];
+    try {
+      final snapshot = await FirebaseFirestore.instance
+          .collection('users')
+          .doc(uid)
+          .collection(collection)
+          .orderBy(orderField, descending: true)
+          .limit(15)
+          .get();
+      for (final doc in snapshot.docs) {
+        final data = doc.data();
+        final name = data['name']?.toString().trim() ?? '';
+        if (name.isEmpty) continue;
+        final subtitle = data['subtitle']?.toString().trim() ?? '';
+        names.add(subtitle.isEmpty ? name : '$name ($subtitle)');
+      }
+    } catch (_) {}
+    return names;
   }
 
   Future<
@@ -698,6 +696,33 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
               _english ? 'EN' : 'RO',
               style: const TextStyle(fontWeight: FontWeight.bold),
             ),
+          ),
+          IconButton(
+            icon: Icon(
+              _withContext ? Icons.person_pin_circle : Icons.person_off,
+            ),
+            tooltip: _withContext
+                ? (_english ? 'Personal context: on' : 'Context personal: pornit')
+                : (_english
+                    ? 'Personal context: off'
+                    : 'Context personal: oprit'),
+            onPressed: () {
+              setState(() => _withContext = !_withContext);
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  duration: const Duration(seconds: 1),
+                  content: Text(
+                    _withContext
+                        ? (_english
+                            ? 'Personal context on'
+                            : 'Context personal pornit')
+                        : (_english
+                            ? 'Personal context off'
+                            : 'Context personal oprit'),
+                  ),
+                ),
+              );
+            },
           ),
           IconButton(
             icon: Icon(_ttsEnabled ? Icons.volume_up : Icons.volume_off),

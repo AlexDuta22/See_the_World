@@ -735,6 +735,9 @@ class _HomePageState extends State<HomePage> {
                               onPressed: () async {
                                 final path = await _captureMemoryPhoto(
                                   place.id,
+                                  name: place.name,
+                                  lat: place.position.latitude,
+                                  lng: place.position.longitude,
                                 );
                                 if (!mounted) return;
                                 if (path == null || path.isEmpty) return;
@@ -1253,7 +1256,13 @@ class _HomePageState extends State<HomePage> {
     } catch (_) {}
   }
 
-  Future<String?> _captureMemoryPhoto(String placeId) async {
+  Future<String?> _captureMemoryPhoto(
+    String placeId, {
+    String name = '',
+    String subtitle = '',
+    double? lat,
+    double? lng,
+  }) async {
     try {
       final picked = await _picker.pickImage(
         source: ImageSource.camera,
@@ -1272,12 +1281,44 @@ class _HomePageState extends State<HomePage> {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('memory_photo_$placeId', saved.path);
       await _incrementVisitedCount();
+      await _recordVisitedPlace(
+        placeId: placeId,
+        name: name,
+        subtitle: subtitle,
+        lat: lat,
+        lng: lng,
+      );
       _showSnack('Memory photo saved.');
       return saved.path;
     } catch (_) {
       _showSnack('Could not save memory photo.');
       return null;
     }
+  }
+
+  Future<void> _recordVisitedPlace({
+    required String placeId,
+    required String name,
+    required String subtitle,
+    required double? lat,
+    required double? lng,
+  }) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null || name.trim().isEmpty) return;
+    try {
+      await FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.uid)
+          .collection('visited')
+          .doc(placeId)
+          .set({
+            'name': name,
+            'subtitle': subtitle,
+            'lat': lat,
+            'lng': lng,
+            'visitedAt': FieldValue.serverTimestamp(),
+          });
+    } catch (_) {}
   }
 
   Future<File> _persistPickedPhoto({
@@ -1596,7 +1637,13 @@ class _HomePageState extends State<HomePage> {
                             _circleIconButton(
                               icon: Icons.camera_alt_outlined,
                               onPressed: () async {
-                                final path = await _captureMemoryPhoto(placeId);
+                                final path = await _captureMemoryPhoto(
+                                  placeId,
+                                  name: name,
+                                  subtitle: subtitle,
+                                  lat: lat,
+                                  lng: lng,
+                                );
                                 if (!mounted) return;
                                 if (path == null || path.isEmpty) return;
                                 setState(() {
