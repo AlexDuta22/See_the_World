@@ -1,0 +1,28 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Catalog de locuri turistice. Aplicatia ruleaza doar dupa autentificare,
+    // iar seeding-ul si actualizarea tururilor se fac din client, deci permitem
+    // citire si scriere oricarui utilizator autentificat.
+    match /top_places/{placeId} {
+      allow read, write: if request.auth != null;
+    }
+
+    // Profilul unui utilizator. Citire pentru orice utilizator autentificat,
+    // pentru ca login-ul cauta documentul dupa email; scriere doar de proprietar.
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == userId;
+
+      // Datele personale (favorite, vizitate) raman strict ale proprietarului.
+      match /{subPath=**} {
+        allow read, write: if request.auth != null
+                           && request.auth.uid == userId;
+      }
+    }
+
+    // Orice cale neacoperita explicit este interzisa implicit.
+  }
+}
