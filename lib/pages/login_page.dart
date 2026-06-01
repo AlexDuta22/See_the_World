@@ -30,7 +30,19 @@ class _LoginPageState extends State<LoginPage> {
   }
 
   Future<void> signUserIn() async {
-    bool loadingVisible = false;
+    // Capturăm navigator-ul root ÎNAINTE de orice await. Dialogul de încărcare
+    // trăiește pe el. La sign-in reușit, authStateChanges din main.dart comută
+    // home-ul pe HomePage și dezmontează LoginPage (mounted devine false), deci
+    // nu ne putem baza pe `mounted`/`context` ca să închidem dialogul — altfel
+    // spinnerul rămâne agățat peste hartă la nesfârșit.
+    final navigator = Navigator.of(context, rootNavigator: true);
+    var loadingVisible = false;
+    void dismissLoading() {
+      if (!loadingVisible) return;
+      loadingVisible = false;
+      if (navigator.canPop()) navigator.pop();
+    }
+
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -43,6 +55,10 @@ class _LoginPageState extends State<LoginPage> {
         email: emailController.text.trim(),
         password: passwordController.text,
       );
+      // Sign-in reușit: închidem spinnerul imediat. Restul (numele din Firestore)
+      // e doar cache și nu trebuie să mai țină utilizatorul pe ecranul de loading.
+      dismissLoading();
+
       final querySnapshot = await FirebaseFirestore.instance
           .collection('users')
           .where('email', isEqualTo: emailController.text.trim())
@@ -63,15 +79,8 @@ class _LoginPageState extends State<LoginPage> {
       }
       await SharedpreferenceHelper()
           .saveUserEmail(emailController.text.trim());
-      if (mounted && loadingVisible) {
-        Navigator.of(context).pop();
-        loadingVisible = false;
-      }
     } on FirebaseAuthException catch (e) {
-      if (mounted && loadingVisible) {
-        Navigator.of(context).pop();
-        loadingVisible = false;
-      }
+      dismissLoading();
       // Give clearer feedback when credentials are wrong so the user can retry.
       final message = (e.code == 'wrong-password' || e.code == 'user-not-found')
           ? 'Incorrect email or password. Please try again.'
@@ -80,10 +89,7 @@ class _LoginPageState extends State<LoginPage> {
               : (e.message ?? 'Failed to sign in.');
       _showErrorMessage(message);
     } catch (_) {
-      if (mounted && loadingVisible) {
-        Navigator.of(context).pop();
-        loadingVisible = false;
-      }
+      dismissLoading();
       _showErrorMessage('Something went wrong. Please try again.');
     }
   }
@@ -94,11 +100,20 @@ class _LoginPageState extends State<LoginPage> {
   }
 
   Future<void> signInWithGoogle() async {
+    final navigator = Navigator.of(context, rootNavigator: true);
+    var loadingVisible = false;
+    void dismissLoading() {
+      if (!loadingVisible) return;
+      loadingVisible = false;
+      if (navigator.canPop()) navigator.pop();
+    }
+
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (_) => const Center(child: CircularProgressIndicator()),
     );
+    loadingVisible = true;
     try {
       await _ensureGoogleInitialized();
       final GoogleSignInAccount googleUser =
@@ -109,31 +124,42 @@ class _LoginPageState extends State<LoginPage> {
         idToken: googleAuth.idToken,
       );
       await FirebaseAuth.instance.signInWithCredential(credential);
+      dismissLoading();
     } on GoogleSignInException catch (e) {
+      dismissLoading();
       if (e.code == GoogleSignInExceptionCode.canceled) {
         return;
       }
       _showErrorMessage(e.description ?? 'Google sign-in failed.');
     } on FirebaseAuthException catch (e) {
+      dismissLoading();
       _showErrorMessage(e.message ?? 'Google sign-in failed.');
     } catch (_) {
+      dismissLoading();
       _showErrorMessage('Something went wrong with Google sign-in.');
-    } finally {
-      if (mounted) Navigator.of(context).pop();
     }
   }
 
   Future<void> signInWithFacebook() async {
+    final navigator = Navigator.of(context, rootNavigator: true);
+    var loadingVisible = false;
+    void dismissLoading() {
+      if (!loadingVisible) return;
+      loadingVisible = false;
+      if (navigator.canPop()) navigator.pop();
+    }
+
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (_) => const Center(child: CircularProgressIndicator()),
     );
+    loadingVisible = true;
 
     try {
       final LoginResult result = await FacebookAuth.instance.login();
       if (result.status != LoginStatus.success || result.accessToken == null) {
-        if (mounted) Navigator.of(context).pop();
+        dismissLoading();
         if (result.status == LoginStatus.cancelled) return;
         final message = result.message ?? 'Facebook sign-in failed.';
         _showErrorMessage(message);
@@ -144,12 +170,13 @@ class _LoginPageState extends State<LoginPage> {
         result.accessToken!.tokenString,
       );
       await FirebaseAuth.instance.signInWithCredential(credential);
+      dismissLoading();
     } on FirebaseAuthException catch (e) {
+      dismissLoading();
       _showErrorMessage(e.message ?? 'Facebook sign-in failed.');
     } catch (_) {
+      dismissLoading();
       _showErrorMessage('Something went wrong with Facebook sign-in.');
-    } finally {
-      if (mounted) Navigator.of(context).pop();
     }
   }
 
