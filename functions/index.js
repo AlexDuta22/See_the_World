@@ -62,7 +62,10 @@ exports.askGemini = onCall(
         body: JSON.stringify({
           system_instruction: {parts: [{text: systemInstruction}]},
           contents,
-          generationConfig: {maxOutputTokens: 1024},
+          generationConfig: {
+            maxOutputTokens: 2048,
+            thinkingConfig: {thinkingBudget: 0},
+          },
         }),
       });
     } catch (err) {
@@ -78,14 +81,7 @@ exports.askGemini = onCall(
     }
 
     const json = await response.json();
-    const text =
-      json &&
-      json.candidates &&
-      json.candidates[0] &&
-      json.candidates[0].content &&
-      json.candidates[0].content.parts &&
-      json.candidates[0].content.parts[0] &&
-      json.candidates[0].content.parts[0].text;
+    const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
 
     if (!text) {
       logger.error("Răspuns gol de la Gemini", JSON.stringify(json));
