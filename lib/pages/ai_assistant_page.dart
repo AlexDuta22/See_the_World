@@ -193,7 +193,7 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     });
     _scrollToBottom();
 
-    final result = await _callGemini(trimmed);
+    final result = await _callGemini();
     if (!mounted) return;
     setState(() {
       _isLoading = false;
@@ -289,8 +289,11 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     return buffer.toString();
   }
 
-  Future<({String? text, String? error})> _callGemini(String userText) async {
+  Future<({String? text, String? error})> _callGemini() async {
     try {
+      // _messages conține deja întreaga conversație, inclusiv mesajul tocmai
+      // trimis de utilizator (adăugat în _sendMessage), așa că NU îl mai adăugăm
+      // încă o dată — altfel ultima tură 'user' ajungea dublată în request.
       final contents = <Map<String, dynamic>>[];
       for (final m in _messages) {
         if (m.isWelcome) continue;
@@ -301,12 +304,6 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
           ],
         });
       }
-      contents.add({
-        'role': 'user',
-        'parts': [
-          {'text': userText},
-        ],
-      });
 
       final systemInstruction = _systemPrompt + await _buildUserContext();
 
