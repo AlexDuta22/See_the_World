@@ -56,7 +56,7 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       : _googleMapsApiKey;
 
   static const String _systemPromptRo =
-      'Ești un asistent de călătorie specializat în România și Europa. '
+      'Ești un asistent de călătorie specializat în România. '
       'Când utilizatorul îți descrie timpul disponibil, preferințele și interesele, '
       'oferi recomandări personalizate de destinații, locuri de vizitat, '
       'activități, rute și sfaturi practice. '
@@ -67,7 +67,7 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       'Când recomanzi locuri, include și ce activități se pot face acolo.';
 
   static const String _systemPromptEn =
-      'You are a travel assistant specialized in Romania and Europe. '
+      'You are a travel assistant specialized in Romania. '
       'When the user describes their available time, preferences and interests, '
       'you give personalized recommendations of destinations, places to visit, '
       'activities, routes and practical tips. '

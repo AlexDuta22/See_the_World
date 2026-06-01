@@ -23,7 +23,7 @@ singur oras si poate fi extinsa la orice locatie.
 - Profil cu statistici (locuri vizitate, tururi finalizate).
 
 ### 3. Asistent conversational personalizat
-- Chat (text sau voce) care recomanda destinatii din Romania si Europa.
+- Chat (text sau voce) care recomanda destinatii din Romania.
 - Fundamenteaza recomandarile pe favoritele si locurile vizitate de utilizator.
 - Cheia Gemini sta exclusiv pe server, intr-o Cloud Function autentificata
   (`askGemini`); clientul nu o contine niciodata.
