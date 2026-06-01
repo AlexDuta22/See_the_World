@@ -1,10 +1,18 @@
+import 'dart:convert';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+
+final ValueNotifier<List<AiMapPlace>> aiMapPlacesRequest =
+    ValueNotifier<List<AiMapPlace>>(const []);
 
 class AiAssistantPage extends StatefulWidget {
   const AiAssistantPage({super.key});
@@ -31,6 +39,21 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   // Firebase, iar apelul trece printr-o Cloud Function autentificată
   // (askGemini). Astfel cheia nu poate fi extrasă din APK sau din trafic.
   static const String _functionsRegion = 'europe-west1';
+
+  static const String _googleMapsApiKey = String.fromEnvironment(
+    'GOOGLE_MAPS_API_KEY',
+    defaultValue: '',
+  );
+  static const String _googlePlacesApiKey = String.fromEnvironment(
+    'GOOGLE_PLACES_API_KEY',
+    defaultValue: '',
+  );
+  static const MethodChannel _platformKeys = MethodChannel(
+    'com.example.see_the_world/keys',
+  );
+  String _placesApiKey = _googlePlacesApiKey.isNotEmpty
+      ? _googlePlacesApiKey
+      : _googleMapsApiKey;
 
   static const String _systemPromptRo =
       'Ești un asistent de călătorie specializat în România și Europa. '
@@ -195,22 +218,106 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
 
     final result = await _callGemini();
     if (!mounted) return;
-    setState(() {
-      _isLoading = false;
-      if (result.text != null) {
-        _messages.add(_ChatMessage(text: result.text!, isUser: false));
-        if (_ttsEnabled) _tts.speak(result.text!);
-      } else {
+    if (result.text != null) {
+      final aiMessage = _ChatMessage(text: result.text!, isUser: false);
+      setState(() {
+        _isLoading = false;
+        _messages.add(aiMessage);
+      });
+      if (_ttsEnabled) _tts.speak(result.text!);
+      _scrollToBottom();
+      if (result.places.isNotEmpty) _resolvePlaces(aiMessage, result.places);
+    } else {
+      setState(() {
+        _isLoading = false;
         _messages.add(
           _ChatMessage(
             text: result.error ??
-                'Nu am putut obține un răspuns. Verifică cheia API sau conexiunea la internet.',
+                'Nu am putut obține un răspuns. Verifică conexiunea la internet.',
             isUser: false,
           ),
         );
-      }
+      });
+      _scrollToBottom();
+    }
+  }
+
+  Future<void> _resolvePlaces(
+    _ChatMessage message,
+    List<({String name, String area})> raw,
+  ) async {
+    await _ensurePlacesApiKey();
+    if (_placesApiKey.isEmpty) return;
+    final resolved = <AiMapPlace>[];
+    for (final p in raw) {
+      final place = await _geocodePlace(p.name, p.area);
+      if (place != null) resolved.add(place);
+    }
+    if (!mounted || resolved.isEmpty) return;
+    final index = _messages.indexOf(message);
+    if (index == -1) return;
+    setState(() {
+      _messages[index] = message.copyWith(places: resolved);
     });
     _scrollToBottom();
+  }
+
+  Future<void> _ensurePlacesApiKey() async {
+    if (_placesApiKey.isNotEmpty) return;
+    try {
+      final key = await _platformKeys.invokeMethod<String>('getPlacesApiKey');
+      if (key != null && key.isNotEmpty) _placesApiKey = key;
+    } catch (_) {}
+  }
+
+  Future<AiMapPlace?> _geocodePlace(String name, String area) async {
+    final input = Uri.encodeComponent(area.isEmpty ? name : '$name, $area');
+    final url = Uri.parse(
+      'https://maps.googleapis.com/maps/api/place/findplacefromtext/json'
+      '?input=$input&inputtype=textquery'
+      '&fields=geometry,name,formatted_address,photos,place_id'
+      '&key=$_placesApiKey',
+    );
+    try {
+      final response = await http.get(url);
+      if (response.statusCode != 200) return null;
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final candidates = data['candidates'] as List<dynamic>? ?? [];
+      if (candidates.isEmpty) return null;
+      final c = candidates.first as Map<String, dynamic>;
+      final location =
+          (c['geometry'] as Map<String, dynamic>?)?['location']
+              as Map<String, dynamic>?;
+      final lat = (location?['lat'] as num?)?.toDouble();
+      final lng = (location?['lng'] as num?)?.toDouble();
+      if (lat == null || lng == null) return null;
+      final resolvedName = (c['name']?.toString().trim().isNotEmpty ?? false)
+          ? c['name'].toString()
+          : name;
+      final address = c['formatted_address']?.toString() ?? '';
+      final placeId = c['place_id']?.toString() ?? '';
+      var photoUrl = '';
+      final photos = c['photos'] as List<dynamic>?;
+      if (photos != null && photos.isNotEmpty) {
+        final ref = (photos.first as Map<String, dynamic>)['photo_reference']
+            ?.toString();
+        if (ref != null && ref.isNotEmpty) {
+          photoUrl = 'https://maps.googleapis.com/maps/api/place/photo'
+              '?maxwidth=400&photoreference=$ref&key=$_placesApiKey';
+        }
+      }
+      return AiMapPlace(
+        name: resolvedName,
+        area: area,
+        address: address,
+        lat: lat,
+        lng: lng,
+        placeId: placeId,
+        photoUrl: photoUrl,
+      );
+    } catch (_) {
+      return null;
+    }
   }
 
   // Citește datele personale ale utilizatorului din Firestore (locuri favorite)
@@ -289,7 +396,12 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     return buffer.toString();
   }
 
-  Future<({String? text, String? error})> _callGemini() async {
+  Future<
+      ({
+        String? text,
+        List<({String name, String area})> places,
+        String? error,
+      })> _callGemini() async {
     try {
       // _messages conține deja întreaga conversație, inclusiv mesajul tocmai
       // trimis de utilizator (adăugat în _sendMessage), așa că NU îl mai adăugăm
@@ -321,16 +433,40 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
 
       final text = response.data['text']?.toString();
       if (text == null || text.isEmpty) {
-        return (text: null, error: 'Răspuns gol de la asistent.');
+        return (
+          text: null,
+          places: const <({String name, String area})>[],
+          error: 'Răspuns gol de la asistent.',
+        );
       }
-      return (text: text, error: null);
+      final rawPlaces = response.data['places'];
+      final places = <({String name, String area})>[];
+      if (rawPlaces is List) {
+        for (final item in rawPlaces) {
+          if (item is Map) {
+            final name = item['name']?.toString().trim() ?? '';
+            if (name.isEmpty) continue;
+            final area = item['area']?.toString().trim() ?? '';
+            places.add((name: name, area: area));
+          }
+        }
+      }
+      return (text: text, places: places, error: null);
     } on FirebaseFunctionsException catch (e) {
       // Includem și codul (not-found, unauthenticated, unavailable...) ca să fie
       // ușor de diagnosticat. 'not-found' = funcția nu e deployată / regiune greșită.
       final detail = e.message ?? 'fără detalii';
-      return (text: null, error: 'Eroare asistent [${e.code}]: $detail');
+      return (
+        text: null,
+        places: const <({String name, String area})>[],
+        error: 'Eroare asistent [${e.code}]: $detail',
+      );
     } catch (e) {
-      return (text: null, error: 'Excepție: $e');
+      return (
+        text: null,
+        places: const <({String name, String area})>[],
+        error: 'Excepție: $e',
+      );
     }
   }
 
@@ -344,6 +480,193 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         );
       }
     });
+  }
+
+  Widget _buildPlacesCard(_ChatMessage message, bool isDark) {
+    final places = message.places;
+    return Container(
+      margin: const EdgeInsets.only(right: 48, top: 2, bottom: 8),
+      decoration: BoxDecoration(
+        color: isDark ? Colors.grey.shade800 : Colors.grey.shade100,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: isDark ? Colors.grey.shade700 : Colors.grey.shade300,
+        ),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            height: 180,
+            child: GoogleMap(
+              initialCameraPosition: CameraPosition(
+                target: LatLng(places.first.lat, places.first.lng),
+                zoom: 11,
+              ),
+              markers: _markersForPlaces(places),
+              onMapCreated: (controller) => _fitToPlaces(controller, places),
+              myLocationButtonEnabled: false,
+              zoomControlsEnabled: false,
+              scrollGesturesEnabled: false,
+              zoomGesturesEnabled: false,
+              rotateGesturesEnabled: false,
+              tiltGesturesEnabled: false,
+              liteModeEnabled: false,
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(10, 8, 10, 4),
+            child: Wrap(
+              spacing: 6,
+              runSpacing: 2,
+              children: [
+                for (final place in places)
+                  ActionChip(
+                    avatar: const Icon(Icons.place, size: 16),
+                    label: Text(place.name),
+                    onPressed: () => _showAiPlaceDetails(place),
+                  ),
+              ],
+            ),
+          ),
+          Align(
+            alignment: Alignment.centerRight,
+            child: TextButton.icon(
+              onPressed: () {
+                aiMapPlacesRequest.value = places;
+                Navigator.of(context).popUntil((route) => route.isFirst);
+              },
+              icon: const Icon(Icons.map_outlined, size: 18),
+              label: Text(
+                _english ? 'See on the big map' : 'Vezi pe harta mare',
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Set<Marker> _markersForPlaces(List<AiMapPlace> places) {
+    final markers = <Marker>{};
+    for (var i = 0; i < places.length; i++) {
+      final place = places[i];
+      final id = place.placeId.isNotEmpty ? place.placeId : 'ai-$i';
+      markers.add(
+        Marker(
+          markerId: MarkerId(id),
+          position: LatLng(place.lat, place.lng),
+          infoWindow: InfoWindow(title: place.name),
+          onTap: () => _showAiPlaceDetails(place),
+        ),
+      );
+    }
+    return markers;
+  }
+
+  Future<void> _fitToPlaces(
+    GoogleMapController controller,
+    List<AiMapPlace> places,
+  ) async {
+    if (places.length == 1) {
+      await controller.animateCamera(
+        CameraUpdate.newLatLngZoom(
+          LatLng(places.first.lat, places.first.lng),
+          12,
+        ),
+      );
+      return;
+    }
+    var minLat = places.first.lat;
+    var maxLat = places.first.lat;
+    var minLng = places.first.lng;
+    var maxLng = places.first.lng;
+    for (final p in places.skip(1)) {
+      if (p.lat < minLat) minLat = p.lat;
+      if (p.lat > maxLat) maxLat = p.lat;
+      if (p.lng < minLng) minLng = p.lng;
+      if (p.lng > maxLng) maxLng = p.lng;
+    }
+    final bounds = LatLngBounds(
+      southwest: LatLng(minLat, minLng),
+      northeast: LatLng(maxLat, maxLng),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    try {
+      await controller.animateCamera(
+        CameraUpdate.newLatLngBounds(bounds, 48),
+      );
+    } catch (_) {}
+  }
+
+  void _showAiPlaceDetails(AiMapPlace place) {
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        return Dialog(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (place.photoUrl.isNotEmpty)
+                Image.network(
+                  place.photoUrl,
+                  height: 180,
+                  width: double.infinity,
+                  fit: BoxFit.cover,
+                  // ignore: unnecessary_underscores
+                  errorBuilder: (_, __, ___) => Container(
+                    height: 180,
+                    color: Colors.grey.shade300,
+                    child: const Center(
+                      child: Icon(Icons.photo, color: Colors.black45),
+                    ),
+                  ),
+                ),
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      place.name,
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    if (place.address.isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Icon(Icons.place_outlined, size: 16),
+                          const SizedBox(width: 4),
+                          Expanded(child: Text(place.address)),
+                        ],
+                      ),
+                    ],
+                    const SizedBox(height: 12),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: TextButton(
+                        onPressed: () => Navigator.of(context).pop(),
+                        child: Text(_english ? 'Close' : 'Închide'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
   }
 
   @override
@@ -397,9 +720,14 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
                 if (index == _messages.length) {
                   return const _TypingIndicator();
                 }
-                return _MessageBubble(
-                  message: _messages[index],
-                  isDark: isDark,
+                final message = _messages[index];
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _MessageBubble(message: message, isDark: isDark),
+                    if (!message.isUser && message.places.isNotEmpty)
+                      _buildPlacesCard(message, isDark),
+                  ],
                 );
               },
             ),
@@ -507,10 +835,40 @@ class _ChatMessage {
     required this.text,
     required this.isUser,
     this.isWelcome = false,
+    this.places = const [],
   });
   final String text;
   final bool isUser;
   final bool isWelcome;
+  final List<AiMapPlace> places;
+
+  _ChatMessage copyWith({List<AiMapPlace>? places}) {
+    return _ChatMessage(
+      text: text,
+      isUser: isUser,
+      isWelcome: isWelcome,
+      places: places ?? this.places,
+    );
+  }
+}
+
+class AiMapPlace {
+  const AiMapPlace({
+    required this.name,
+    required this.area,
+    required this.address,
+    required this.lat,
+    required this.lng,
+    required this.placeId,
+    required this.photoUrl,
+  });
+  final String name;
+  final String area;
+  final String address;
+  final double lat;
+  final double lng;
+  final String placeId;
+  final String photoUrl;
 }
 
 class _MessageBubble extends StatelessWidget {

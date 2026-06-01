@@ -62,6 +62,7 @@ class _HomePageState extends State<HomePage> {
   Set<Polyline> _tourPolylines = {};
   String? _activeCategory;
   Set<Marker> _categoryMarkers = {};
+  Set<Marker> _aiMarkers = {};
 
   static const CameraPosition _initialCameraPosition = CameraPosition(
     target: LatLng(45.7489, 21.2087), // Timisoara
@@ -102,10 +103,12 @@ class _HomePageState extends State<HomePage> {
     _loadPlacesApiKey();
     _seedTopPlacesIfEmpty();
     _loadOfflineTour();
+    aiMapPlacesRequest.addListener(_handleAiPlacesRequest);
   }
 
   @override
   void dispose() {
+    aiMapPlacesRequest.removeListener(_handleAiPlacesRequest);
     _positionSub?.cancel();
     _compassSub?.cancel();
     _mapController?.dispose();
@@ -153,6 +156,7 @@ class _HomePageState extends State<HomePage> {
                 if (_showTourMarkers) ..._tourMarkers,
                 ..._searchMarkers,
                 ..._categoryMarkers,
+                ..._aiMarkers,
               };
               return GoogleMap(
                 onMapCreated: (controller) {
@@ -396,6 +400,51 @@ class _HomePageState extends State<HomePage> {
 
   void _openPage(Widget page) {
     Navigator.of(context).push(MaterialPageRoute(builder: (_) => page));
+  }
+
+  void _handleAiPlacesRequest() {
+    final places = aiMapPlacesRequest.value;
+    if (places.isEmpty || !mounted) return;
+    aiMapPlacesRequest.value = const [];
+    _showAiPlacesOnMap(places);
+  }
+
+  void _showAiPlacesOnMap(List<AiMapPlace> places) {
+    final markers = <Marker>{};
+    for (var i = 0; i < places.length; i++) {
+      final p = places[i];
+      final id = p.placeId.isNotEmpty ? p.placeId : 'ai-$i';
+      markers.add(
+        Marker(
+          markerId: MarkerId('ai-$id'),
+          position: LatLng(p.lat, p.lng),
+          infoWindow: InfoWindow(title: p.name),
+          onTap: () => _showPlaceDetails(
+            placeId: id,
+            name: p.name,
+            subtitle: p.area,
+            description: p.address.isEmpty ? p.area : p.address,
+            imageUrl: p.photoUrl,
+            lat: p.lat,
+            lng: p.lng,
+          ),
+        ),
+      );
+    }
+    setState(() => _aiMarkers = markers);
+    if (places.length == 1) {
+      _mapController?.animateCamera(
+        CameraUpdate.newLatLngZoom(
+          LatLng(places.first.lat, places.first.lng),
+          14,
+        ),
+      );
+    } else {
+      _animateToBounds(
+        places.map((p) => LatLng(p.lat, p.lng)).toList(growable: false),
+      );
+    }
+    _showSnack('Locurile recomandate de asistent sunt acum pe hartă.');
   }
 
   void _onSearch() {
