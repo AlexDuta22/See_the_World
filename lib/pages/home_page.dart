@@ -34,6 +34,9 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   GoogleMapController? _mapController;
   bool _hasLocationPermission = false;
+  // Centrăm pe locația utilizatorului o singură dată la deschidere, indiferent
+  // dacă permisiunea sau harta se inițializează prima.
+  bool _didInitialLocate = false;
   bool _isRouting = false;
   bool _isNavigating = false;
   Set<Polyline> _polylines = {};
@@ -154,7 +157,7 @@ class _HomePageState extends State<HomePage> {
               return GoogleMap(
                 onMapCreated: (controller) {
                   _mapController = controller;
-                  if (_hasLocationPermission) _goToCurrentLocation();
+                  _centerOnUserInitial();
                 },
                 initialCameraPosition: _initialCameraPosition,
                 markers: combinedMarkers,
@@ -971,7 +974,7 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) return;
     setState(() => _hasLocationPermission = granted);
     if (granted) {
-      await _goToCurrentLocation();
+      await _centerOnUserInitial();
     }
   }
 
@@ -1011,8 +1014,35 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Future<void> _goToCurrentLocation() async {
-    if (_mapController == null) return;
+  // Centrare automată pe utilizator la prima deschidere. E apelată atât din
+  // onMapCreated cât și după ce se acordă permisiunea — oricare se termină ultima
+  // declanșează efectiv mutarea, o singură dată (gardată de _didInitialLocate).
+  Future<void> _centerOnUserInitial() async {
+    if (_didInitialLocate) return;
+    if (_mapController == null || !_hasLocationPermission) return;
+
+    // Sărim instant pe ultima poziție cunoscută (din cache, fără așteptare GPS),
+    // ca să nu se mai vadă Timișoara la deschidere.
+    try {
+      final last = await Geolocator.getLastKnownPosition();
+      if (!mounted || _mapController == null) return;
+      if (last != null) {
+        _didInitialLocate = true;
+        await _mapController!.animateCamera(
+          CameraUpdate.newLatLngZoom(LatLng(last.latitude, last.longitude), 15),
+        );
+      }
+    } catch (_) {
+      // Fără ultima poziție; rafinăm direct cu poziția curentă mai jos.
+    }
+
+    // Rafinăm cu poziția reală curentă.
+    final ok = await _goToCurrentLocation();
+    if (ok) _didInitialLocate = true;
+  }
+
+  Future<bool> _goToCurrentLocation() async {
+    if (_mapController == null) return false;
     try {
       final position = await Geolocator.getCurrentPosition(
         locationSettings: const LocationSettings(
@@ -1025,8 +1055,10 @@ class _HomePageState extends State<HomePage> {
         CameraUpdate.newLatLngZoom(target, 15),
       );
       await _refreshNearbySuggestions();
+      return true;
     } catch (_) {
       _showSnack('Could not fetch current location.');
+      return false;
     }
   }
 
