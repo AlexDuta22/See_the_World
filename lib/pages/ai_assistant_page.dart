@@ -40,6 +40,12 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   // (askGemini). Astfel cheia nu poate fi extrasă din APK sau din trafic.
   static const String _functionsRegion = 'europe-west1';
 
+  // Câte mesaje din istoric trimitem la Gemini per apel. Plafonarea ține
+  // costul și latența constante: fără ea, fiecare tură ar retrimite toată
+  // conversația, care crește nelimitat. ~12 mesaje = ~6 schimburi, suficient
+  // pentru continuitate fără să cărăm tot firul.
+  static const int _maxHistoryMessages = 12;
+
   static const String _googleMapsApiKey = String.fromEnvironment(
     'GOOGLE_MAPS_API_KEY',
     defaultValue: '',
@@ -154,7 +160,7 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       await _speech.stop();
       setState(() => _isListening = false);
       if (_partialText.trim().isNotEmpty) {
-         final text = _partialText.trim();
+        final text = _partialText.trim();
         _partialText = '';
         await _sendMessage(text);
       }
@@ -232,7 +238,8 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         _isLoading = false;
         _messages.add(
           _ChatMessage(
-            text: result.error ??
+            text:
+                result.error ??
                 'Nu am putut obține un răspuns. Verifică conexiunea la internet.',
             isUser: false,
           ),
@@ -302,7 +309,8 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         final ref = (photos.first as Map<String, dynamic>)['photo_reference']
             ?.toString();
         if (ref != null && ref.isNotEmpty) {
-          photoUrl = 'https://maps.googleapis.com/maps/api/place/photo'
+          photoUrl =
+              'https://maps.googleapis.com/maps/api/place/photo'
               '?maxwidth=400&photoreference=$ref&key=$_placesApiKey';
         }
       }
@@ -395,24 +403,34 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   }
 
   Future<
-      ({
-        String? text,
-        List<({String name, String area})> places,
-        String? error,
-      })> _callGemini() async {
+    ({String? text, List<({String name, String area})> places, String? error})
+  >
+  _callGemini() async {
     try {
       // _messages conține deja întreaga conversație, inclusiv mesajul tocmai
       // trimis de utilizator (adăugat în _sendMessage), așa că NU îl mai adăugăm
       // încă o dată — altfel ultima tură 'user' ajungea dublată în request.
-      final contents = <Map<String, dynamic>>[];
+      final allContents = <Map<String, dynamic>>[];
       for (final m in _messages) {
         if (m.isWelcome) continue;
-        contents.add({
+        allContents.add({
           'role': m.isUser ? 'user' : 'model',
           'parts': [
             {'text': m.text},
           ],
         });
+      }
+
+      // Trimitem doar ultimele _maxHistoryMessages mesaje (mesajul curent e
+      // ultimul, deci mereu inclus). Gemini cere ca primul element să aibă
+      // rolul 'user', așa că după tăiere eliminăm un eventual 'model' rămas
+      // în frunte.
+      final start = allContents.length > _maxHistoryMessages
+          ? allContents.length - _maxHistoryMessages
+          : 0;
+      final contents = allContents.sublist(start);
+      while (contents.isNotEmpty && contents.first['role'] == 'model') {
+        contents.removeAt(0);
       }
 
       final systemInstruction = _systemPrompt + await _buildUserContext();
@@ -592,9 +610,7 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     );
     await Future<void>.delayed(const Duration(milliseconds: 300));
     try {
-      await controller.animateCamera(
-        CameraUpdate.newLatLngBounds(bounds, 48),
-      );
+      await controller.animateCamera(CameraUpdate.newLatLngBounds(bounds, 48));
     } catch (_) {}
   }
 
@@ -678,10 +694,7 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
             Icon(Icons.smart_toy_outlined, size: 22),
             SizedBox(width: 8),
             Flexible(
-              child: Text(
-                'AI Assistant',
-                overflow: TextOverflow.ellipsis,
-              ),
+              child: Text('AI Assistant', overflow: TextOverflow.ellipsis),
             ),
           ],
         ),
@@ -702,10 +715,12 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
               _withContext ? Icons.person_pin_circle : Icons.person_off,
             ),
             tooltip: _withContext
-                ? (_english ? 'Personal context: on' : 'Context personal: pornit')
+                ? (_english
+                      ? 'Personal context: on'
+                      : 'Context personal: pornit')
                 : (_english
-                    ? 'Personal context: off'
-                    : 'Context personal: oprit'),
+                      ? 'Personal context: off'
+                      : 'Context personal: oprit'),
             onPressed: () {
               setState(() => _withContext = !_withContext);
               ScaffoldMessenger.of(context).showSnackBar(
@@ -714,11 +729,11 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
                   content: Text(
                     _withContext
                         ? (_english
-                            ? 'Personal context on'
-                            : 'Context personal pornit')
+                              ? 'Personal context on'
+                              : 'Context personal pornit')
                         : (_english
-                            ? 'Personal context off'
-                            : 'Context personal oprit'),
+                              ? 'Personal context off'
+                              : 'Context personal oprit'),
                   ),
                 ),
               );
