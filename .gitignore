@@ -1,10 +1,13 @@
 # Claude Code local settings
 .claude/
 
-# Secrets / API keys (NU se comit — folositi fisierele .example ca template)
+# Secrets / API keys (NU se comit)
 /dart_defines.json
 android/app/src/main/res/values/google_maps_api.xml
 android/app/src/main/res/values/facebook.xml
+
+# Fisiere template .example - nedorite in proiect
+*.example
 
 # Miscellaneous
 *.class
