@@ -3,6 +3,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:flutter_facebook_auth/flutter_facebook_auth.dart';
+import 'package:random_string/random_string.dart';
 import 'package:see_the_world/components/my_textfield.dart';
 
 import '../components/my_button.dart';
@@ -94,6 +95,56 @@ class _LoginPageState extends State<LoginPage> {
     }
   }
 
+  // Un login social (Google/Facebook) creează contul de Auth, dar NU și
+  // documentul din `users` — pe care înregistrarea pe email îl scrie explicit.
+  // Restul aplicației (profil, favorite, id-ul intern din SharedPreferences) se
+  // bazează pe el, așa că îl creăm la primul login social și-l reutilizăm apoi.
+  Future<void> _syncUserProfile(User? user) async {
+    if (user == null) return;
+    final docRef =
+        FirebaseFirestore.instance.collection('users').doc(user.uid);
+    final snapshot = await docRef.get();
+
+    final email = user.email?.trim() ?? '';
+    final displayName = (user.displayName?.trim().isNotEmpty ?? false)
+        ? user.displayName!.trim()
+        : (email.contains('@') ? email.split('@').first : 'Traveler');
+    final photoUrl = user.photoURL?.trim() ?? '';
+
+    String id;
+    String name;
+    if (snapshot.exists) {
+      final data = snapshot.data() ?? <String, dynamic>{};
+      id = data['id']?.toString() ?? '';
+      name = (data['name']?.toString().trim().isNotEmpty ?? false)
+          ? data['name'].toString().trim()
+          : displayName;
+      if (id.isEmpty) {
+        // Document vechi/incomplet: completăm doar id-ul, fără să-l atingem pe rest.
+        id = randomAlphaNumeric(10);
+        await docRef.set({'id': id}, SetOptions(merge: true));
+      }
+    } else {
+      id = randomAlphaNumeric(10);
+      name = displayName;
+      await docRef.set({
+        'id': id,
+        'name': name,
+        'email': email,
+        if (photoUrl.isNotEmpty) 'photoUrl': photoUrl,
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+    }
+
+    await SharedpreferenceHelper().saveUserId(id);
+    if (name.isNotEmpty) {
+      await SharedpreferenceHelper().saveUserDisplayName(name);
+    }
+    if (email.isNotEmpty) {
+      await SharedpreferenceHelper().saveUserEmail(email);
+    }
+  }
+
   Future<void> _ensureGoogleInitialized() {
     _googleInitFuture ??= GoogleSignIn.instance.initialize();
     return _googleInitFuture!;
@@ -123,7 +174,9 @@ class _LoginPageState extends State<LoginPage> {
       final credential = GoogleAuthProvider.credential(
         idToken: googleAuth.idToken,
       );
-      await FirebaseAuth.instance.signInWithCredential(credential);
+      final userCredential =
+          await FirebaseAuth.instance.signInWithCredential(credential);
+      await _syncUserProfile(userCredential.user);
       dismissLoading();
     } on GoogleSignInException catch (e) {
       dismissLoading();
@@ -169,7 +222,9 @@ class _LoginPageState extends State<LoginPage> {
       final credential = FacebookAuthProvider.credential(
         result.accessToken!.tokenString,
       );
-      await FirebaseAuth.instance.signInWithCredential(credential);
+      final userCredential =
+          await FirebaseAuth.instance.signInWithCredential(credential);
+      await _syncUserProfile(userCredential.user);
       dismissLoading();
     } on FirebaseAuthException catch (e) {
       dismissLoading();
