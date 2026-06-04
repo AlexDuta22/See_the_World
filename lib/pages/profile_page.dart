@@ -22,12 +22,10 @@ class ProfilePage extends StatefulWidget {
 }
 
 class _ProfilePageState extends State<ProfilePage> {
-  static const String _visitedCountKey = 'visited_places_count';
-  static const String _toursCompletedKey = 'tours_completed_count';
   static const String _userNameKey = 'USERNAMEKEY';
 
-  int _visitedCount = 0;
-  int _toursCompleted = 0;
+  // „Tours completed" nu e încă implementat (nu se scrie nicăieri), deci rămâne 0.
+  final int _toursCompleted = 0;
   bool _isUploadingPhoto = false;
   final ImagePicker _picker = ImagePicker();
   String _cachedDisplayName = '';
@@ -35,17 +33,7 @@ class _ProfilePageState extends State<ProfilePage> {
   @override
   void initState() {
     super.initState();
-    _loadCounters();
     _loadCachedProfile();
-  }
-
-  Future<void> _loadCounters() async {
-    final prefs = await SharedPreferences.getInstance();
-    if (!mounted) return;
-    setState(() {
-      _visitedCount = prefs.getInt(_visitedCountKey) ?? 0;
-      _toursCompleted = prefs.getInt(_toursCompletedKey) ?? 0;
-    });
   }
 
   Future<void> _loadCachedProfile() async {
@@ -162,6 +150,33 @@ class _ProfilePageState extends State<ProfilePage> {
     );
   }
 
+  Widget _visitedStatRow(User? user) {
+    if (user == null) {
+      return _statRow(
+        icon: Icons.check_circle,
+        color: Colors.green,
+        label: 'Places visited',
+        value: 0,
+      );
+    }
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.uid)
+          .collection('visited')
+          .snapshots(),
+      builder: (context, snapshot) {
+        final count = snapshot.data?.docs.length ?? 0;
+        return _statRow(
+          icon: Icons.check_circle,
+          color: Colors.green,
+          label: 'Places visited',
+          value: count,
+        );
+      },
+    );
+  }
+
   Widget _profileHeader(User? user) {
     if (user == null) {
       return _profileRow(name: 'Guest', photoUrl: '', canEdit: false);
@@ -256,12 +271,7 @@ class _ProfilePageState extends State<ProfilePage> {
                 ),
               ),
               const SizedBox(height: 8),
-              _statRow(
-                icon: Icons.check_circle,
-                color: Colors.green,
-                label: 'Places visited',
-                value: _visitedCount,
-              ),
+              _visitedStatRow(FirebaseAuth.instance.currentUser),
               const SizedBox(height: 6),
               _favoritesStatRow(FirebaseAuth.instance.currentUser),
               const SizedBox(height: 6),
@@ -381,7 +391,7 @@ class _ProfilePageState extends State<ProfilePage> {
           ),
         ),
         ListTile(
-          title: Text('Clear visited history ($_visitedCount)'),
+          title: const Text('Clear visited history'),
           trailing: const Icon(Icons.delete_outline),
           onTap: _confirmClearVisitedHistory,
         ),
@@ -395,7 +405,7 @@ class _ProfilePageState extends State<ProfilePage> {
       builder: (context) {
         return AlertDialog(
           title: const Text('Clear visited history?'),
-          content: const Text('This will reset your visited places counter.'),
+          content: const Text('This will delete all your visited places.'),
           actions: [
             TextButton(
               onPressed: () => Navigator.of(context).pop(false),
@@ -410,11 +420,25 @@ class _ProfilePageState extends State<ProfilePage> {
       },
     );
     if (!mounted) return;
-    if (confirmed != true) return;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt(_visitedCountKey, 0);
-    if (!mounted) return;
-    setState(() => _visitedCount = 0);
-    _showSnack('Visited history cleared.');
+    final user = FirebaseAuth.instance.currentUser;
+    if (confirmed != true || user == null) return;
+    try {
+      final visited = FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.uid)
+          .collection('visited');
+      final snapshot = await visited.get();
+      final batch = FirebaseFirestore.instance.batch();
+      for (final doc in snapshot.docs) {
+        batch.delete(doc.reference);
+      }
+      await batch.commit();
+      // StreamBuilder-ul din profil reflectă singur noul total (0).
+      if (mounted) _showSnack('Visited history cleared.');
+    } on FirebaseException catch (e) {
+      if (mounted) _showSnack(e.message ?? 'Could not clear visited history.');
+    } catch (_) {
+      if (mounted) _showSnack('Could not clear visited history.');
+    }
   }
 }

@@ -1280,7 +1280,6 @@ class _HomePageState extends State<HomePage> {
       }
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('memory_photo_$placeId', saved.path);
-      await _incrementVisitedCount();
       await _recordVisitedPlace(
         placeId: placeId,
         name: name,
@@ -1330,13 +1329,6 @@ class _HomePageState extends State<HomePage> {
       '${dir.path}/${filenamePrefix}_${DateTime.now().millisecondsSinceEpoch}.jpg',
     );
     return File(picked.path).copy(target.path);
-  }
-
-  Future<void> _incrementVisitedCount() async {
-    final prefs = await SharedPreferences.getInstance();
-    const key = 'visited_places_count';
-    final current = prefs.getInt(key) ?? 0;
-    await prefs.setInt(key, current + 1);
   }
 
   Widget _buildLocalSearchField() {
