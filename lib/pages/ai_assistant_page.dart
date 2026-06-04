@@ -6,6 +6,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:flutter_tts/flutter_tts.dart';
@@ -34,6 +35,13 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   bool _english = false;
   bool _withContext = true;
   String _partialText = '';
+
+  // Locația curentă (reverse-geocodată) injectată în contextul AI, ca Gemini să
+  // prioritizeze locuri apropiate. O luăm o singură dată per sesiune ca să nu
+  // adăugăm latență/cereri la fiecare mesaj.
+  String _locationArea = '';
+  String _locationCoords = '';
+  bool _locationTried = false;
 
   // Cheia Gemini NU mai există în client. Stă exclusiv pe server, ca secret
   // Firebase, iar apelul trece printr-o Cloud Function autentificată
@@ -333,16 +341,25 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return '';
 
+    final location = await _fetchLocationContext();
     final favorites = await _readPlaceNames(user.uid, 'favorites', 'updatedAt');
     final visited = await _readPlaceNames(user.uid, 'visited', 'visitedAt');
 
-    if (favorites.isEmpty && visited.isEmpty) return '';
+    if (location.isEmpty && favorites.isEmpty && visited.isEmpty) return '';
 
     final buffer = StringBuffer();
     if (_english) {
       buffer.write(
         '\n\nUser personalization context — use it to tailor every recommendation:',
       );
+      if (location.isNotEmpty) {
+        buffer.write(
+          '\n- The user is currently $location. Prioritize places near this '
+          'location and reachable within the time the user says they have '
+          'available; estimate realistic travel time and do not suggest '
+          'destinations too far for their time budget.',
+        );
+      }
       if (favorites.isNotEmpty) {
         buffer.write(
           '\n- Places the user saved as favorites: ${favorites.join(", ")}. '
@@ -360,6 +377,14 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       buffer.write(
         '\n\nContext de personalizare despre utilizator — folosește-l ca să adaptezi fiecare recomandare:',
       );
+      if (location.isNotEmpty) {
+        buffer.write(
+          '\n- Utilizatorul se află acum $location. Prioritizează locuri '
+          'apropiate de această poziție și care pot fi atinse în timpul pe care '
+          'spune că îl are la dispoziție; estimează realist timpul de deplasare '
+          'și nu sugera destinații prea îndepărtate pentru timpul lui.',
+        );
+      }
       if (favorites.isNotEmpty) {
         buffer.write(
           '\n- Locuri salvate la favorite: ${favorites.join(", ")}. '
@@ -400,6 +425,99 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       }
     } catch (_) {}
     return names;
+  }
+
+  // Locația curentă pentru contextul AI. Returnează o expresie gata de inserat
+  // (ex. „în zona Timișoara, Timiș, România (lat, lng)") sau '' dacă nu avem
+  // permisiune/poziție. O luăm o singură dată per sesiune; dacă utilizatorul
+  // refuză permisiunea, nu mai insistăm.
+  Future<String> _fetchLocationContext() async {
+    if (!_locationTried) {
+      _locationTried = true;
+      try {
+        if (await _ensureLocationPermissionSilent()) {
+          Position? pos = await Geolocator.getLastKnownPosition();
+          pos ??= await Geolocator.getCurrentPosition(
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.medium,
+              timeLimit: Duration(seconds: 8),
+            ),
+          );
+          _locationCoords =
+              'lat ${pos.latitude.toStringAsFixed(4)}, '
+              'lng ${pos.longitude.toStringAsFixed(4)}';
+          _locationArea = await _reverseGeocode(pos.latitude, pos.longitude);
+        }
+      } catch (_) {
+        // Context de locație opțional: dacă pică (timeout, GPS oprit), mergem fără el.
+      }
+    }
+    if (_locationCoords.isEmpty) return '';
+    final coords = '($_locationCoords)';
+    if (_locationArea.isEmpty) {
+      return _english ? 'at coordinates $coords' : 'la coordonatele $coords';
+    }
+    return _english
+        ? 'near $_locationArea $coords'
+        : 'în zona $_locationArea $coords';
+  }
+
+  Future<bool> _ensureLocationPermissionSilent() async {
+    if (!await Geolocator.isLocationServiceEnabled()) return false;
+    var permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+    return permission != LocationPermission.denied &&
+        permission != LocationPermission.deniedForever;
+  }
+
+  // Transformă coordonatele într-o zonă lizibilă (oraș, județ, țară) prin
+  // Geocoding API, cu aceeași cheie Places. Returnează '' la orice eroare.
+  Future<String> _reverseGeocode(double lat, double lng) async {
+    await _ensurePlacesApiKey();
+    if (_placesApiKey.isEmpty) return '';
+    final lang = _english ? 'en' : 'ro';
+    final url = Uri.parse(
+      'https://maps.googleapis.com/maps/api/geocode/json'
+      '?latlng=$lat,$lng&language=$lang&key=$_placesApiKey',
+    );
+    try {
+      final response = await http.get(url);
+      if (response.statusCode != 200) return '';
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final results = data['results'] as List<dynamic>? ?? [];
+      if (results.isEmpty) return '';
+      final components =
+          (results.first as Map<String, dynamic>)['address_components']
+              as List<dynamic>? ??
+          [];
+      String pick(String type) {
+        for (final c in components) {
+          final types = (c as Map<String, dynamic>)['types'] as List<dynamic>?;
+          if (types != null && types.contains(type)) {
+            return c['long_name']?.toString() ?? '';
+          }
+        }
+        return '';
+      }
+
+      final city = [
+        pick('locality'),
+        pick('postal_town'),
+        pick('administrative_area_level_2'),
+      ].firstWhere((s) => s.isNotEmpty, orElse: () => '');
+      final county = pick('administrative_area_level_1');
+      final country = pick('country');
+      final parts = [
+        city,
+        county,
+        country,
+      ].where((p) => p.isNotEmpty).toList();
+      return parts.join(', ');
+    } catch (_) {
+      return '';
+    }
   }
 
   Future<
