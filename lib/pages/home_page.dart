@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_compass/flutter_compass.dart';
@@ -53,7 +54,9 @@ class _HomePageState extends State<HomePage> {
   Position? _lastPosition;
   final ImagePicker _picker = ImagePicker();
   final TextEditingController _searchController = TextEditingController();
-  XFile? _lastCapturedPhoto;
+  // amintiri foto per user (Firestore + Storage)
+  final List<_PhotoMemory> _photoMemories = [];
+  Set<Marker> _photoMemoryMarkers = {};
   StreamSubscription<Position>? _positionSub;
   List<_NavStep> _navSteps = [];
   List<_OfflinePlace> _offlinePlaces = [];
@@ -103,6 +106,7 @@ class _HomePageState extends State<HomePage> {
     _loadPlacesApiKey();
     _seedTopPlacesIfEmpty();
     _loadOfflineTour();
+    _loadPhotoMemories();
     aiMapPlacesRequest.addListener(_handleAiPlacesRequest);
   }
 
@@ -157,8 +161,10 @@ class _HomePageState extends State<HomePage> {
                 ..._searchMarkers,
                 ..._categoryMarkers,
                 ..._aiMarkers,
+                ..._photoMemoryMarkers,
               };
               return GoogleMap(
+                style: isDark ? _nightMapStyle : null,
                 onMapCreated: (controller) {
                   _mapController = controller;
                   _centerOnUserInitial();
@@ -172,50 +178,6 @@ class _HomePageState extends State<HomePage> {
               );
             },
           ),
-          if (_lastCapturedPhoto != null)
-            Positioned(
-              bottom: 96,
-              right: 16,
-              child: SafeArea(
-                child: Material(
-                  elevation: 4,
-                  borderRadius: BorderRadius.circular(12),
-                  clipBehavior: Clip.antiAlias,
-                  child: Stack(
-                    children: [
-                      SizedBox(
-                        width: 120,
-                        height: 160,
-                        child: Image.file(
-                          File(_lastCapturedPhoto!.path),
-                          fit: BoxFit.cover,
-                        ),
-                      ),
-                      Positioned(
-                        top: 6,
-                        right: 6,
-                        child: Container(
-                          decoration: BoxDecoration(
-                            color: Colors.black45,
-                            borderRadius: BorderRadius.circular(8),
-                          ),
-                          child: IconButton(
-                            padding: EdgeInsets.zero,
-                            iconSize: 18,
-                            color: Colors.white,
-                            icon: const Icon(Icons.close),
-                            tooltip: 'Remove photo preview',
-                            onPressed: () => setState(() {
-                              _lastCapturedPhoto = null;
-                            }),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
           Positioned(
             top: 12,
             left: 16,
@@ -999,6 +961,11 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _openCamera() async {
     try {
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null) {
+        _showSnack('Autentifică-te ca să salvezi amintiri.');
+        return;
+      }
       final picked = await _picker.pickImage(
         source: ImageSource.camera,
         imageQuality: 85,
@@ -1010,15 +977,225 @@ class _HomePageState extends State<HomePage> {
         picked: picked,
         filenamePrefix: 'capture',
       );
-      setState(() {
-        _lastCapturedPhoto = XFile(saved.path);
-      });
-      _showSnack(
-        'Photo saved: ${saved.path.split(Platform.pathSeparator).last}',
+
+      // pin la locatia curenta
+      Position? pos = _lastPosition;
+      try {
+        pos = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+          ),
+        );
+      } catch (_) {}
+      if (pos == null) {
+        if (mounted) _showSnack('Nu am putut obține locația pentru poză.');
+        return;
+      }
+
+      // urc poza in Storage, salvez amintirea in Firestore
+      final id = DateTime.now().millisecondsSinceEpoch.toString();
+      String imageUrl = '';
+      try {
+        final ref = FirebaseStorage.instance
+            .ref()
+            .child('users')
+            .child(user.uid)
+            .child('memories')
+            .child('$id.jpg');
+        await ref.putFile(File(saved.path));
+        imageUrl = await ref.getDownloadURL();
+      } catch (_) {}
+
+      final memory = _PhotoMemory(
+        id: id,
+        imageUrl: imageUrl,
+        localPath: saved.path,
+        position: LatLng(pos.latitude, pos.longitude),
+        takenAt: DateTime.now(),
       );
+
+      try {
+        await FirebaseFirestore.instance
+            .collection('users')
+            .doc(user.uid)
+            .collection('memories')
+            .doc(id)
+            .set({
+              'lat': memory.position.latitude,
+              'lng': memory.position.longitude,
+              'takenAt': Timestamp.fromDate(memory.takenAt),
+              'imageUrl': imageUrl,
+              'localPath': saved.path,
+            });
+      } catch (_) {
+        if (mounted) _showSnack('Nu am putut salva amintirea în cloud.');
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _photoMemories.add(memory);
+        _photoMemoryMarkers = _buildPhotoMemoryMarkers();
+      });
+      _mapController?.animateCamera(
+        CameraUpdate.newLatLngZoom(memory.position, 16),
+      );
+      if (mounted) _showSnack('Amintire adăugată pe hartă.');
     } catch (_) {
-      _showSnack('Could not open camera.');
+      if (mounted) _showSnack('Could not open camera.');
     }
+  }
+
+  Set<Marker> _buildPhotoMemoryMarkers() {
+    return _photoMemories.map((m) {
+      return Marker(
+        markerId: MarkerId('photo_${m.id}'),
+        position: m.position,
+        icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRose),
+        infoWindow: const InfoWindow(title: 'Amintirea ta'),
+        onTap: () => _showPhotoMemory(m),
+      );
+    }).toSet();
+  }
+
+  void _showPhotoMemory(_PhotoMemory memory) {
+    final localPath = memory.localPath;
+    // ca pozele portret sa nu iasa din dialog
+    final maxImageHeight = MediaQuery.of(context).size.height * 0.6;
+    final Widget image;
+    if (localPath != null && File(localPath).existsSync()) {
+      image = Image.file(File(localPath), fit: BoxFit.contain);
+    } else if (memory.imageUrl.isNotEmpty) {
+      image = Image.network(memory.imageUrl, fit: BoxFit.contain);
+    } else {
+      image = const SizedBox(
+        height: 160,
+        child: Center(child: Icon(Icons.broken_image_outlined, size: 40)),
+      );
+    }
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        return Dialog(
+          clipBehavior: Clip.antiAlias,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ConstrainedBox(
+                constraints: BoxConstraints(maxHeight: maxImageHeight),
+                child: image,
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(14, 10, 6, 6),
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.place,
+                      size: 18,
+                      color: Color(0xFF2575FC),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Amintire din ${_formatMemoryDate(memory.takenAt)}',
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.delete_outline),
+                      tooltip: 'Șterge amintirea',
+                      onPressed: () {
+                        Navigator.of(context).pop();
+                        _deletePhotoMemory(memory);
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  String _formatMemoryDate(DateTime d) {
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${two(d.day)}.${two(d.month)}.${d.year}';
+  }
+
+  Future<void> _loadPhotoMemories() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+    try {
+      final snapshot = await FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.uid)
+          .collection('memories')
+          .orderBy('takenAt', descending: true)
+          .get();
+      final loaded = <_PhotoMemory>[];
+      for (final doc in snapshot.docs) {
+        final data = doc.data();
+        final lat = (data['lat'] as num?)?.toDouble();
+        final lng = (data['lng'] as num?)?.toDouble();
+        if (lat == null || lng == null) continue;
+        final takenAt = data['takenAt'];
+        loaded.add(
+          _PhotoMemory(
+            id: doc.id,
+            imageUrl: data['imageUrl'] as String? ?? '',
+            localPath: data['localPath'] as String?,
+            position: LatLng(lat, lng),
+            takenAt: takenAt is Timestamp ? takenAt.toDate() : DateTime.now(),
+          ),
+        );
+      }
+      if (!mounted) return;
+      setState(() {
+        _photoMemories
+          ..clear()
+          ..addAll(loaded);
+        _photoMemoryMarkers = _buildPhotoMemoryMarkers();
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _deletePhotoMemory(_PhotoMemory memory) async {
+    if (!mounted) return;
+    setState(() {
+      _photoMemories.removeWhere((m) => m.id == memory.id);
+      _photoMemoryMarkers = _buildPhotoMemoryMarkers();
+    });
+    final user = FirebaseAuth.instance.currentUser;
+    if (user != null) {
+      try {
+        await FirebaseFirestore.instance
+            .collection('users')
+            .doc(user.uid)
+            .collection('memories')
+            .doc(memory.id)
+            .delete();
+      } catch (_) {}
+      try {
+        await FirebaseStorage.instance
+            .ref()
+            .child('users')
+            .child(user.uid)
+            .child('memories')
+            .child('${memory.id}.jpg')
+            .delete();
+      } catch (_) {}
+    }
+    final localPath = memory.localPath;
+    if (localPath != null) {
+      try {
+        File(localPath).deleteSync();
+      } catch (_) {}
+    }
+    if (mounted) _showSnack('Amintire ștearsă.');
   }
 
   Future<void> _ensureLocationPermission() async {
@@ -1153,6 +1330,8 @@ class _HomePageState extends State<HomePage> {
       final nearbyPlaces = <String, _NearbyPlace>{};
       for (final item in results) {
         final place = item as Map<String, dynamic>;
+        // Keep only genuine sightseeing objectives (no casinos, clubs, shops).
+        if (!_isTouristAttraction(place)) continue;
         final placeId = place['place_id']?.toString();
         final name = place['name']?.toString();
         final location =
@@ -1756,12 +1935,67 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  // Google Maps "night" style, applied when the app is in dark mode so the map
+  // matches the rest of the dark UI instead of staying bright.
+  static const _nightMapStyle = '''
+[
+  {"elementType": "geometry", "stylers": [{"color": "#242f3e"}]},
+  {"elementType": "labels.text.stroke", "stylers": [{"color": "#242f3e"}]},
+  {"elementType": "labels.text.fill", "stylers": [{"color": "#746855"}]},
+  {"featureType": "administrative.locality", "elementType": "labels.text.fill", "stylers": [{"color": "#d59563"}]},
+  {"featureType": "poi", "elementType": "labels.text.fill", "stylers": [{"color": "#d59563"}]},
+  {"featureType": "poi.park", "elementType": "geometry", "stylers": [{"color": "#263c3f"}]},
+  {"featureType": "poi.park", "elementType": "labels.text.fill", "stylers": [{"color": "#6b9a76"}]},
+  {"featureType": "road", "elementType": "geometry", "stylers": [{"color": "#38414e"}]},
+  {"featureType": "road", "elementType": "geometry.stroke", "stylers": [{"color": "#212a37"}]},
+  {"featureType": "road", "elementType": "labels.text.fill", "stylers": [{"color": "#9ca5b3"}]},
+  {"featureType": "road.highway", "elementType": "geometry", "stylers": [{"color": "#746855"}]},
+  {"featureType": "road.highway", "elementType": "geometry.stroke", "stylers": [{"color": "#1f2835"}]},
+  {"featureType": "road.highway", "elementType": "labels.text.fill", "stylers": [{"color": "#f3d19c"}]},
+  {"featureType": "transit", "elementType": "geometry", "stylers": [{"color": "#2f3948"}]},
+  {"featureType": "transit.station", "elementType": "labels.text.fill", "stylers": [{"color": "#d59563"}]},
+  {"featureType": "water", "elementType": "geometry", "stylers": [{"color": "#17263c"}]},
+  {"featureType": "water", "elementType": "labels.text.fill", "stylers": [{"color": "#515c6d"}]},
+  {"featureType": "water", "elementType": "labels.text.stroke", "stylers": [{"color": "#17263c"}]}
+]
+''';
+
   static const _categoryExcludedTypes = <String, Set<String>>{
     'restaurant': {'gas_station', 'fuel', 'lodging', 'convenience_store'},
     'museum': {'restaurant', 'lodging', 'gas_station'},
     'park': {'restaurant', 'lodging', 'gas_station'},
     'lodging': {'gas_station', 'fuel', 'restaurant'},
   };
+
+  // Google tags some venues (casinos, clubs, bars, shops) with
+  // `tourist_attraction` too, so we drop anything whose types reveal it is
+  // really a nightlife or commercial spot rather than a sightseeing objective.
+  static const _nonTouristTypes = <String>{
+    'casino',
+    'night_club',
+    'bar',
+    'liquor_store',
+    'gas_station',
+    'fuel',
+    'car_rental',
+    'car_repair',
+    'car_dealer',
+    'shopping_mall',
+    'store',
+    'supermarket',
+    'convenience_store',
+    'atm',
+    'bank',
+    'pharmacy',
+    'lodging',
+  };
+
+  bool _isTouristAttraction(Map<String, dynamic> place) {
+    final placeTypes =
+        (place['types'] as List<dynamic>?)?.cast<String>().toSet() ??
+        const <String>{};
+    return placeTypes.intersection(_nonTouristTypes).isEmpty;
+  }
 
   Future<void> _fetchCategoryPlaces(String type) async {
     if (_placesApiKey.isEmpty) return;
@@ -2153,6 +2387,22 @@ class _NearbyPlace {
   final String id;
   final String name;
   final LatLng position;
+}
+
+class _PhotoMemory {
+  const _PhotoMemory({
+    required this.id,
+    required this.imageUrl,
+    required this.localPath,
+    required this.position,
+    required this.takenAt,
+  });
+
+  final String id;
+  final String imageUrl;
+  final String? localPath;
+  final LatLng position;
+  final DateTime takenAt;
 }
 
 class _RouteData {
