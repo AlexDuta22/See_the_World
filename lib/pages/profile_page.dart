@@ -1,9 +1,11 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -23,6 +25,15 @@ class ProfilePage extends StatefulWidget {
 
 class _ProfilePageState extends State<ProfilePage> {
   static const String _userNameKey = 'USERNAMEKEY';
+
+  // Configurare EmailJS (gratis, fără server). Completează cu valorile din
+  // contul tău de pe emailjs.com — nu sunt secrete, pot sta în client:
+  //   Service ID  → Email Services
+  //   Template ID → Email Templates
+  //   Public Key  → Account → General → Public Key
+  static const String _emailjsServiceId = 'service_o6yfvqi';
+  static const String _emailjsTemplateId = 'template_gn1xa5f';
+  static const String _emailjsPublicKey = 'PtrjFCqBBeKC63h8s';
 
   // „Tours completed" nu e încă implementat (nu se scrie nicăieri), deci rămâne 0.
   final int _toursCompleted = 0;
@@ -83,16 +94,10 @@ class _ProfilePageState extends State<ProfilePage> {
             },
           ),
           _sectionTile(
-            icon: Icons.star_border,
-            title: 'Rate the app',
+            icon: Icons.rate_review_outlined,
+            title: 'Rate & feedback',
             trailing: const Icon(Icons.chevron_right),
-            onTap: () => _showSnack('Thanks for your feedback!'),
-          ),
-          _sectionTile(
-            icon: Icons.feedback_outlined,
-            title: 'Share feedback',
-            trailing: const Icon(Icons.chevron_right),
-            onTap: () => _showSnack('Feedback form coming soon.'),
+            onTap: _onSendFeedback,
           ),
         ],
       ),
@@ -327,6 +332,63 @@ class _ProfilePageState extends State<ProfilePage> {
     ).showSnackBar(SnackBar(content: Text(message)));
   }
 
+  Future<void> _onSendFeedback() async {
+    // Un singur dialog adună și nota (stele), și mesajul; ambele pleacă
+    // împreună, deci primești un singur email.
+    final result = await showDialog<({int rating, String message})>(
+      context: context,
+      builder: (_) => const _FeedbackDialog(),
+    );
+    if (result == null) return;
+    final message = result.message.trim();
+    await _submitFeedback(
+      rating: result.rating > 0 ? result.rating : null,
+      message: message.isNotEmpty ? message : null,
+    );
+  }
+
+  // Trimite rating-ul și/sau mesajul pe email prin EmailJS (gratis, fără server).
+  // Cererea pleacă direct din aplicație; cheile EmailJS sunt publice prin design.
+  Future<void> _submitFeedback({int? rating, String? message}) async {
+    final email = FirebaseAuth.instance.currentUser?.email ?? 'necunoscut';
+    final stars = rating != null ? '★' * rating + '☆' * (5 - rating) : '—';
+    try {
+      final response = await http.post(
+        Uri.parse('https://api.emailjs.com/api/v1.0/email/send'),
+        headers: const {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'service_id': _emailjsServiceId,
+          'template_id': _emailjsTemplateId,
+          'user_id': _emailjsPublicKey,
+          'template_params': {
+            'rating': rating?.toString() ?? '—',
+            'stars': stars,
+            'message': message ?? '(fără mesaj)',
+            'from_email': email,
+          },
+        }),
+      );
+      if (!mounted) return;
+      if (response.statusCode == 200) {
+        _showSnack(
+          rating != null
+              ? 'Mulțumim pentru aprecierea ta de $rating ${rating == 1 ? 'stea' : 'stele'}!'
+              : 'Mulțumim! Feedback-ul tău a fost trimis.',
+        );
+      } else {
+        final reason = response.body.trim();
+        _showSnack(
+          'Nu am putut trimite (${response.statusCode})'
+          '${reason.isEmpty ? '' : ': $reason'}',
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        _showSnack('Nu am putut trimite feedback-ul. Încearcă din nou.');
+      }
+    }
+  }
+
   Future<void> _pickProfilePhoto() async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
@@ -440,5 +502,202 @@ class _ProfilePageState extends State<ProfilePage> {
     } catch (_) {
       if (mounted) _showSnack('Could not clear visited history.');
     }
+  }
+}
+
+/// Dialog estetic unic pentru „Rate & feedback": adună nota (stele animate) și
+/// un mesaj opțional, întoarse împreună ca (rating, message) — sau null la
+/// renunțare. Cu ambele într-un singur dialog rezultă un singur email.
+class _FeedbackDialog extends StatefulWidget {
+  const _FeedbackDialog();
+
+  @override
+  State<_FeedbackDialog> createState() => _FeedbackDialogState();
+}
+
+class _FeedbackDialogState extends State<_FeedbackDialog> {
+  final TextEditingController _controller = TextEditingController();
+  int _rating = 0;
+
+  static const List<String> _labels = [
+    'Atinge o stea',
+    'Slab',
+    'Acceptabil',
+    'Bun',
+    'Foarte bun',
+    'Extraordinar!',
+  ];
+
+  // Permitem trimiterea cu o notă SAU un mesaj (nu obligăm ambele).
+  bool get _canSend => _rating > 0 || _controller.text.trim().isNotEmpty;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller.addListener(() => setState(() {}));
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 24),
+      child: Container(
+        decoration: BoxDecoration(
+          color: isDark ? const Color(0xFF1E1E2A) : Colors.white,
+          borderRadius: BorderRadius.circular(24),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.25),
+              blurRadius: 24,
+              offset: const Offset(0, 12),
+            ),
+          ],
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Header cu gradient.
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(vertical: 26),
+                decoration: const BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [Color(0xFF6A11CB), Color(0xFF2575FC)],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                ),
+                child: const Column(
+                  children: [
+                    Icon(
+                      Icons.emoji_emotions_outlined,
+                      color: Colors.white,
+                      size: 46,
+                    ),
+                    SizedBox(height: 8),
+                    Text(
+                      'Îți place See the World?',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 18),
+              Text(
+                'Acordă-ne o notă atingând stelele',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: isDark ? Colors.white70 : Colors.black54,
+                ),
+              ),
+              const SizedBox(height: 14),
+              // Stele animate.
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: List.generate(5, (i) {
+                  final index = i + 1;
+                  final selected = index <= _rating;
+                  return GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => setState(() => _rating = index),
+                    child: AnimatedScale(
+                      scale: selected ? 1.18 : 1.0,
+                      duration: const Duration(milliseconds: 180),
+                      curve: Curves.easeOutBack,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                        child: Icon(
+                          selected
+                              ? Icons.star_rounded
+                              : Icons.star_outline_rounded,
+                          size: 44,
+                          color: selected
+                              ? const Color(0xFFFFC107)
+                              : (isDark ? Colors.white30 : Colors.black26),
+                        ),
+                      ),
+                    ),
+                  );
+                }),
+              ),
+              const SizedBox(height: 10),
+              AnimatedSwitcher(
+                duration: const Duration(milliseconds: 150),
+                child: Text(
+                  _labels[_rating],
+                  key: ValueKey<int>(_rating),
+                  style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: _rating == 0
+                        ? (isDark ? Colors.white38 : Colors.black38)
+                        : const Color(0xFFFFA000),
+                  ),
+                ),
+              ),
+              // Mesaj opțional, în cuvinte.
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
+                child: TextField(
+                  controller: _controller,
+                  maxLines: 4,
+                  maxLength: 1000,
+                  textCapitalization: TextCapitalization.sentences,
+                  decoration: InputDecoration(
+                    hintText: 'Spune-ne și în cuvinte (opțional)...',
+                    filled: true,
+                    fillColor: isDark
+                        ? Colors.white.withValues(alpha: 0.05)
+                        : const Color(0xFFF7F8FB),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: BorderSide.none,
+                    ),
+                  ),
+                ),
+              ),
+              // Butoane.
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextButton(
+                        onPressed: () => Navigator.of(context).pop(),
+                        child: const Text('Mai târziu'),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: FilledButton(
+                        onPressed: _canSend
+                            ? () => Navigator.of(context).pop(
+                                (rating: _rating, message: _controller.text),
+                              )
+                            : null,
+                        child: const Text('Trimite'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }
