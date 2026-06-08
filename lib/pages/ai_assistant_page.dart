@@ -70,7 +70,8 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       : _googleMapsApiKey;
 
   static const String _systemPromptRo =
-      'Ești un asistent de călătorie specializat în România. '
+      'Ești un asistent de călătorie care poate oferi recomandări pentru orice oraș sau țară din lume. '
+      'Dacă îți este indicată locația curentă a utilizatorului, ține cont de ea și prioritizează recomandări relevante pentru zona respectivă, fără a te limita la o singură țară. '
       'Când utilizatorul îți descrie timpul disponibil, preferințele și interesele, '
       'oferi recomandări personalizate de destinații, locuri de vizitat, '
       'activități, rute și sfaturi practice. '
@@ -81,7 +82,8 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       'Când recomanzi locuri, include și ce activități se pot face acolo.';
 
   static const String _systemPromptEn =
-      'You are a travel assistant specialized in Romania. '
+      'You are a travel assistant that can recommend places in any city or country in the world. '
+      "If the user's current location is provided, take it into account and prioritize recommendations relevant to that area, without limiting yourself to a single country. "
       'When the user describes their available time, preferences and interests, '
       'you give personalized recommendations of destinations, places to visit, '
       'activities, routes and practical tips. '
@@ -509,11 +511,7 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       ].firstWhere((s) => s.isNotEmpty, orElse: () => '');
       final county = pick('administrative_area_level_1');
       final country = pick('country');
-      final parts = [
-        city,
-        county,
-        country,
-      ].where((p) => p.isNotEmpty).toList();
+      final parts = [city, county, country].where((p) => p.isNotEmpty).toList();
       return parts.join(', ');
     } catch (_) {
       return '';
