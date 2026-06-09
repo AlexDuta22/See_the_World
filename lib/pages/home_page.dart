@@ -23,6 +23,9 @@ import 'favorite_places_page.dart';
 import 'offline_tours_page.dart';
 import 'profile_page.dart';
 import '../widgets/app_bottom_nav.dart';
+import '../services/discover_themes.dart';
+import '../services/discover_service.dart';
+import '../services/taste_profile.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key, this.showTour = false});
@@ -63,16 +66,22 @@ class _HomePageState extends State<HomePage> {
   Set<Marker> _tourMarkers = {};
   bool _showTourMarkers = false;
   Set<Polyline> _tourPolylines = {};
-  String? _activeCategory;
-  Set<Marker> _categoryMarkers = {};
   Set<Marker> _aiMarkers = {};
+
+  // Discover pe harta: tema aleasa (null = Popular near you), profil, eticheta, raza
+  DiscoverTheme? _selectedTheme;
+  TasteProfile _tasteProfile = TasteProfile.empty;
+  bool _profileBuilt = false;
+  bool _discoverInitialized = false;
+  String _discoverLabel = '';
+  double _discoverRadiusKm = 0;
+  static const List<double> _discoverRadiusSteps = [3000, 8000, 15000, 25000];
 
   static const CameraPosition _initialCameraPosition = CameraPosition(
     target: LatLng(45.7489, 21.2087), // Timisoara
     zoom: 13,
   );
   static const String _offlineTimisoaraTourKey = 'offline_tour_timisoara_v2';
-  static const double _nearbyRadiusMeters = 5000;
   static const double _fieldOfViewDegrees = 45;
 
   static const String _googleMapsApiKey = String.fromEnvironment(
@@ -159,7 +168,6 @@ class _HomePageState extends State<HomePage> {
                 ...markers,
                 if (_showTourMarkers) ..._tourMarkers,
                 ..._searchMarkers,
-                ..._categoryMarkers,
                 ..._aiMarkers,
                 ..._photoMemoryMarkers,
               };
@@ -198,7 +206,13 @@ class _HomePageState extends State<HomePage> {
               top: 70,
               left: 0,
               right: 0,
-              child: SafeArea(child: _buildFilterRow()),
+              child: SafeArea(child: _buildThemeRow()),
+            ),
+          if (_navSteps.isEmpty && !_showTourMarkers && _proximityActive)
+            Positioned(
+              top: 118,
+              left: 16,
+              child: SafeArea(child: _buildDiscoverBanner()),
             ),
           if (_showTourMarkers)
             Positioned(
@@ -547,16 +561,21 @@ class _HomePageState extends State<HomePage> {
   }
 
   Set<Marker> _buildNearbyMarkers(Iterable<_NearbyPlace> places) {
-    return places
-        .map(
-          (place) => Marker(
-            markerId: MarkerId(place.id),
-            position: place.position,
-            infoWindow: InfoWindow(title: place.name),
-            onTap: () => _showNearbyPlaceDetails(place),
-          ),
-        )
-        .toSet();
+    return places.map((place) {
+      final theme = place.theme;
+      return Marker(
+        markerId: MarkerId(place.id),
+        position: place.position,
+        icon: theme == null
+            ? BitmapDescriptor.defaultMarker
+            : BitmapDescriptor.defaultMarkerWithHue(themeInfo(theme).markerHue),
+        infoWindow: InfoWindow(
+          title: place.name,
+          snippet: theme == null ? null : themeInfo(theme).label,
+        ),
+        onTap: () => _showNearbyPlaceDetails(place),
+      );
+    }).toSet();
   }
 
   Future<Map<String, dynamic>?> _fetchNearbyPlaceDetails(
@@ -700,6 +719,7 @@ class _HomePageState extends State<HomePage> {
                                   name: place.name,
                                   lat: place.position.latitude,
                                   lng: place.position.longitude,
+                                  types: place.types,
                                 );
                                 if (!mounted) return;
                                 if (path == null || path.isEmpty) return;
@@ -728,6 +748,7 @@ class _HomePageState extends State<HomePage> {
                                   imageUrl: photoUrl ?? '',
                                   lat: place.position.latitude,
                                   lng: place.position.longitude,
+                                  types: place.types,
                                 );
                               },
                               icon: Icon(
@@ -790,6 +811,7 @@ class _HomePageState extends State<HomePage> {
     required String imageUrl,
     required double? lat,
     required double? lng,
+    List<String> types = const [],
   }) async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
@@ -814,6 +836,7 @@ class _HomePageState extends State<HomePage> {
       'memoryPhotoUrl': memoryUrl,
       'lat': lat,
       'lng': lng,
+      'types': types,
       'updatedAt': FieldValue.serverTimestamp(),
     });
   }
@@ -1283,7 +1306,7 @@ class _HomePageState extends State<HomePage> {
       await _mapController!.animateCamera(
         CameraUpdate.newLatLngZoom(target, 15),
       );
-      await _refreshNearbySuggestions();
+      await _refreshDiscover();
       return true;
     } catch (_) {
       _showSnack('Could not fetch current location.');
@@ -1306,8 +1329,20 @@ class _HomePageState extends State<HomePage> {
         });
   }
 
-  Future<void> _refreshNearbySuggestions() async {
-    if (!_hasLocationPermission) return;
+  Future<void> _ensureTasteProfile() async {
+    if (_profileBuilt) return;
+    _profileBuilt = true;
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+    _tasteProfile = await TasteProfileService(
+      placesApiKey: _placesApiKey,
+    ).build(uid);
+  }
+
+  // ce afisam pe harta: tema aleasa (sau tema preferata) filtrata pe directia
+  // busolei. raza mica (o zi pe jos), largita daca nu gasim destule.
+  Future<void> _refreshDiscover() async {
+    if (!_hasLocationPermission || _placesApiKey.isEmpty) return;
     try {
       final position = await Geolocator.getCurrentPosition(
         locationSettings: const LocationSettings(
@@ -1315,45 +1350,68 @@ class _HomePageState extends State<HomePage> {
         ),
       );
       _lastPosition = position;
-      if (_placesApiKey.isEmpty) return;
-      final url = Uri.parse(
-        'https://maps.googleapis.com/maps/api/place/nearbysearch/json'
-        '?location=${position.latitude},${position.longitude}'
-        '&radius=$_nearbyRadiusMeters'
-        '&type=tourist_attraction'
-        '&key=$_placesApiKey',
-      );
-      final response = await http.get(url);
-      if (response.statusCode != 200) return;
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      final results = data['results'] as List<dynamic>? ?? [];
-      final nearbyPlaces = <String, _NearbyPlace>{};
-      for (final item in results) {
-        final place = item as Map<String, dynamic>;
-        // Keep only genuine sightseeing objectives (no casinos, clubs, shops).
-        if (!_isTouristAttraction(place)) continue;
-        final placeId = place['place_id']?.toString();
-        final name = place['name']?.toString();
-        final location =
-            (place['geometry'] as Map<String, dynamic>?)?['location']
-                as Map<String, dynamic>?;
-        final lat = location?['lat'] as num?;
-        final lng = location?['lng'] as num?;
-        if (placeId == null || name == null || lat == null || lng == null) {
-          continue;
+      await _ensureTasteProfile();
+
+      final hasHistory = _tasteProfile.hasHistory;
+      // prima data pornim pe tema preferata, daca avem istoric
+      if (!_discoverInitialized) {
+        _discoverInitialized = true;
+        if (hasHistory && _tasteProfile.topThemes.isNotEmpty) {
+          _selectedTheme = _tasteProfile.topThemes.first;
         }
-        nearbyPlaces[placeId] = _NearbyPlace(
-          id: placeId,
-          name: name,
-          position: LatLng(lat.toDouble(), lng.toDouble()),
-        );
       }
+      final theme = _selectedTheme; // null = Popular near you
+
+      final service = DiscoverService(placesApiKey: _placesApiKey);
+      final uid = FirebaseAuth.instance.currentUser?.uid;
+      final excluded = uid == null
+          ? <String>{}
+          : await service.visitedPlaceIds(uid);
+
+      var results = <DiscoverCandidate>[];
+      var usedRadius = _discoverRadiusSteps.last;
+      for (final radius in _discoverRadiusSteps) {
+        results = theme == null
+            ? await service.fetchPopular(
+                lat: position.latitude,
+                lng: position.longitude,
+                radius: radius,
+                excludeIds: excluded,
+              )
+            : await service.fetchForTheme(
+                theme: theme,
+                lat: position.latitude,
+                lng: position.longitude,
+                radius: radius,
+                excludeIds: excluded,
+              );
+        usedRadius = radius;
+        if (results.isNotEmpty) break;
+      }
+
+      final nearbyPlaces = <String, _NearbyPlace>{
+        for (final c in results)
+          c.placeId: _NearbyPlace(
+            id: c.placeId,
+            name: c.name,
+            position: LatLng(c.lat, c.lng),
+            types: c.types,
+            theme: c.theme,
+            rating: c.rating,
+          ),
+      };
+
       if (!mounted) return;
       setState(() {
         _nearbyPlaces
           ..clear()
           ..addAll(nearbyPlaces);
         _proximityActive = true;
+        _discoverRadiusKm = usedRadius / 1000;
+        final themeName = theme == null ? '' : themeInfo(theme).label;
+        _discoverLabel = theme == null
+            ? 'Popular near you'
+            : (hasHistory ? 'For you · $themeName' : themeName);
       });
       _applyDirectionalFilter();
     } catch (_) {}
@@ -1441,6 +1499,7 @@ class _HomePageState extends State<HomePage> {
     String subtitle = '',
     double? lat,
     double? lng,
+    List<String> types = const [],
   }) async {
     try {
       final picked = await _picker.pickImage(
@@ -1465,6 +1524,7 @@ class _HomePageState extends State<HomePage> {
         subtitle: subtitle,
         lat: lat,
         lng: lng,
+        types: types,
       );
       _showSnack('Memory photo saved.');
       return saved.path;
@@ -1480,6 +1540,7 @@ class _HomePageState extends State<HomePage> {
     required String subtitle,
     required double? lat,
     required double? lng,
+    List<String> types = const [],
   }) async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null || name.trim().isEmpty) return;
@@ -1494,6 +1555,7 @@ class _HomePageState extends State<HomePage> {
             'subtitle': subtitle,
             'lat': lat,
             'lng': lng,
+            'types': types,
             'visitedAt': FieldValue.serverTimestamp(),
           });
     } catch (_) {}
@@ -1887,50 +1949,76 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _buildFilterRow() {
+  // temele inlocuiesc vechiul filtru de categorii; reapasarea deselecteaza
+  Widget _buildThemeRow() {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     return SingleChildScrollView(
       scrollDirection: Axis.horizontal,
       padding: const EdgeInsets.symmetric(horizontal: 16),
       child: Row(
-        children: _categoryFilters.map((filter) {
-          final isActive = _activeCategory == filter.type;
+        children: DiscoverTheme.values.map((theme) {
+          final info = themeInfo(theme);
+          final isActive = _selectedTheme == theme;
           return Padding(
             padding: const EdgeInsets.only(right: 8),
             child: FilterChip(
               avatar: Icon(
-                filter.icon,
+                info.icon,
                 size: 16,
-                color: isActive ? Colors.white : filter.color,
+                color: isActive ? Colors.white : info.color,
               ),
               label: Text(
-                filter.label,
+                info.label,
                 style: TextStyle(
                   color: isActive ? Colors.white : null,
                   fontWeight: isActive ? FontWeight.w600 : null,
                 ),
               ),
               selected: isActive,
-              selectedColor: filter.color,
+              selectedColor: info.color,
               backgroundColor: isDark ? Colors.grey.shade800 : Colors.white,
               elevation: 3,
               onSelected: (selected) {
-                if (selected) {
-                  setState(() {
-                    _activeCategory = filter.type;
-                    _categoryMarkers = {};
-                  });
-                  _fetchCategoryPlaces(filter.type);
-                } else {
-                  setState(() {
-                    _activeCategory = null;
-                    _categoryMarkers = {};
-                  });
-                }
+                setState(() => _selectedTheme = selected ? theme : null);
+                _refreshDiscover();
               },
             ),
           );
         }).toList(),
+      ),
+    );
+  }
+
+  // eticheta de sub chips: For you / Popular near you / numele temei + raza
+  Widget _buildDiscoverBanner() {
+    if (_discoverLabel.isEmpty) return const SizedBox.shrink();
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return Material(
+      elevation: 3,
+      borderRadius: BorderRadius.circular(10),
+      color: isDark ? Colors.black : Colors.white,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.explore_outlined,
+              size: 16,
+              color: isDark ? Colors.white : Colors.black87,
+            ),
+            const SizedBox(width: 6),
+            Text(
+              '$_discoverLabel · within '
+              '${_discoverRadiusKm.toStringAsFixed(1)} km',
+              style: TextStyle(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w600,
+                color: isDark ? Colors.white : Colors.black87,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1959,139 +2047,6 @@ class _HomePageState extends State<HomePage> {
   {"featureType": "water", "elementType": "labels.text.stroke", "stylers": [{"color": "#17263c"}]}
 ]
 ''';
-
-  static const _categoryExcludedTypes = <String, Set<String>>{
-    'restaurant': {'gas_station', 'fuel', 'lodging', 'convenience_store'},
-    'museum': {'restaurant', 'lodging', 'gas_station'},
-    'park': {'restaurant', 'lodging', 'gas_station'},
-    'lodging': {'gas_station', 'fuel', 'restaurant'},
-  };
-
-  // Google tags some venues (casinos, clubs, bars, shops) with
-  // `tourist_attraction` too, so we drop anything whose types reveal it is
-  // really a nightlife or commercial spot rather than a sightseeing objective.
-  static const _nonTouristTypes = <String>{
-    'casino',
-    'night_club',
-    'bar',
-    'liquor_store',
-    'gas_station',
-    'fuel',
-    'car_rental',
-    'car_repair',
-    'car_dealer',
-    'shopping_mall',
-    'store',
-    'supermarket',
-    'convenience_store',
-    'atm',
-    'bank',
-    'pharmacy',
-    'lodging',
-  };
-
-  bool _isTouristAttraction(Map<String, dynamic> place) {
-    final placeTypes =
-        (place['types'] as List<dynamic>?)?.cast<String>().toSet() ??
-        const <String>{};
-    return placeTypes.intersection(_nonTouristTypes).isEmpty;
-  }
-
-  Future<void> _fetchCategoryPlaces(String type) async {
-    if (_placesApiKey.isEmpty) return;
-    if (!mounted) return;
-    double lat = 45.7489, lng = 21.2087;
-    try {
-      final pos = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-        ),
-      );
-      lat = pos.latitude;
-      lng = pos.longitude;
-    } catch (_) {}
-
-    try {
-      final url = Uri.parse(
-        'https://maps.googleapis.com/maps/api/place/nearbysearch/json'
-        '?location=$lat,$lng'
-        '&radius=5000'
-        '&type=$type'
-        '&rankby=prominence'
-        '&key=$_placesApiKey',
-      );
-      final response = await http.get(url);
-      if (response.statusCode != 200 || !mounted) return;
-
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      final results = data['results'] as List<dynamic>? ?? [];
-      final excluded = _categoryExcludedTypes[type] ?? const {};
-      final markers = <Marker>{};
-
-      for (final item in results) {
-        final place = item as Map<String, dynamic>;
-        final placeId = place['place_id']?.toString();
-        final name = place['name']?.toString();
-        final location =
-            (place['geometry'] as Map<String, dynamic>?)?['location']
-                as Map<String, dynamic>?;
-        final pLat = location?['lat'] as num?;
-        final pLng = location?['lng'] as num?;
-        if (placeId == null || name == null || pLat == null || pLng == null) {
-          continue;
-        }
-
-        // Skip places whose types overlap with the exclusion list for this category.
-        final placeTypes =
-            (place['types'] as List<dynamic>?)?.cast<String>().toSet() ??
-            const <String>{};
-        if (placeTypes.intersection(excluded).isNotEmpty) continue;
-
-        markers.add(
-          Marker(
-            markerId: MarkerId('cat_$placeId'),
-            position: LatLng(pLat.toDouble(), pLng.toDouble()),
-            infoWindow: InfoWindow(title: name),
-            icon: BitmapDescriptor.defaultMarkerWithHue(_categoryHue(type)),
-            onTap: () => _showNearbyPlaceDetails(
-              _NearbyPlace(
-                id: placeId,
-                name: name,
-                position: LatLng(pLat.toDouble(), pLng.toDouble()),
-              ),
-            ),
-          ),
-        );
-      }
-
-      if (!mounted) return;
-      setState(() => _categoryMarkers = markers);
-      if (markers.isNotEmpty) {
-        _mapController?.animateCamera(
-          CameraUpdate.newLatLngZoom(LatLng(lat, lng), 14),
-        );
-      } else {
-        _showSnack('No ${type}s found nearby.');
-      }
-    } catch (_) {
-      if (mounted) _showSnack('Could not load places.');
-    }
-  }
-
-  double _categoryHue(String type) {
-    switch (type) {
-      case 'restaurant':
-        return BitmapDescriptor.hueOrange;
-      case 'museum':
-        return BitmapDescriptor.hueViolet;
-      case 'park':
-        return BitmapDescriptor.hueGreen;
-      case 'lodging':
-        return BitmapDescriptor.hueAzure;
-      default:
-        return BitmapDescriptor.hueRed;
-    }
-  }
 
   Future<void> _seedTopPlacesIfEmpty() async {
     try {
@@ -2336,57 +2291,24 @@ class _HomePageState extends State<HomePage> {
   }
 }
 
-class _CategoryFilter {
-  const _CategoryFilter({
-    required this.label,
-    required this.type,
-    required this.icon,
-    required this.color,
-  });
-
-  final String label;
-  final String type;
-  final IconData icon;
-  final Color color;
-}
-
-const _categoryFilters = [
-  _CategoryFilter(
-    label: 'Restaurant',
-    type: 'restaurant',
-    icon: Icons.restaurant,
-    color: Colors.orange,
-  ),
-  _CategoryFilter(
-    label: 'Muzeu',
-    type: 'museum',
-    icon: Icons.museum_outlined,
-    color: Colors.purple,
-  ),
-  _CategoryFilter(
-    label: 'Parc',
-    type: 'park',
-    icon: Icons.park_outlined,
-    color: Colors.green,
-  ),
-  _CategoryFilter(
-    label: 'Hotel',
-    type: 'lodging',
-    icon: Icons.hotel_outlined,
-    color: Colors.blue,
-  ),
-];
-
 class _NearbyPlace {
   const _NearbyPlace({
     required this.id,
     required this.name,
     required this.position,
+    this.types = const [],
+    this.theme,
+    this.rating,
   });
 
   final String id;
   final String name;
   final LatLng position;
+  // tipurile Places, ca sa le salvam la favorite/vizitat
+  final List<String> types;
+  // tema (culoarea pinului) si nota, cand vin din Discover
+  final DiscoverTheme? theme;
+  final double? rating;
 }
 
 class _PhotoMemory {

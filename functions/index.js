@@ -31,6 +31,8 @@ const RESPONSE_SCHEMA = {
         properties: {
           name: {type: "STRING"},
           area: {type: "STRING"},
+          // optional, doar cand se cere reordonarea unei liste; chatul il ignora
+          why: {type: "STRING"},
         },
         required: ["name"],
       },
@@ -47,7 +49,10 @@ const FORMAT_INSTRUCTION =
   "localizabile pe care le recomanzi, fiecare cu 'name' si 'area' " +
   "(oras/regiune/tara); 'places' este DOAR o lista suplimentara pentru harta " +
   "si NU inlocuieste descrierile din 'answer'. Daca nu recomanzi locuri anume, " +
-  "pune 'places' lista goala.";
+  "pune 'places' lista goala. Daca utilizatorul iti da o lista fixa de locuri " +
+  "si iti cere sa o reordonezi/clasifici, NU inventa locuri noi: pune in " +
+  "'places' exact acele locuri, in ordinea recomandata (cel mai potrivit " +
+  "primul), fiecare cu un camp 'why' = un singur rand scurt cu motivul.";
 
 exports.askGemini = onCall(
   {
@@ -134,6 +139,7 @@ exports.askGemini = onCall(
           .map((p) => ({
             name: p.name.trim(),
             area: typeof p.area === "string" ? p.area.trim() : "",
+            why: typeof p.why === "string" ? p.why.trim() : "",
           }))
           .slice(0, 8);
       }
