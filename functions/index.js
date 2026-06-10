@@ -33,6 +33,9 @@ const RESPONSE_SCHEMA = {
           area: {type: "STRING"},
           // optional, doar cand se cere reordonarea unei liste; chatul il ignora
           why: {type: "STRING"},
+          // categorie de tip Google Places (museum, park, restaurant...),
+          // folosita doar pentru analiza experimentului; chatul o ignora
+          category: {type: "STRING"},
         },
         required: ["name"],
       },
@@ -52,7 +55,11 @@ const FORMAT_INSTRUCTION =
   "pune 'places' lista goala. Daca utilizatorul iti da o lista fixa de locuri " +
   "si iti cere sa o reordonezi/clasifici, NU inventa locuri noi: pune in " +
   "'places' exact acele locuri, in ordinea recomandata (cel mai potrivit " +
-  "primul), fiecare cu un camp 'why' = un singur rand scurt cu motivul.";
+  "primul), fiecare cu un camp 'why' = un singur rand scurt cu motivul." +
+  " Pentru fiecare loc din 'places' include si un camp 'category' = o singura " +
+  "categorie de tip Google Places reprezentativa pentru acel loc " +
+  "(ex. museum, park, restaurant, church, art_gallery, natural_feature, " +
+  "tourist_attraction).";
 
 exports.askGemini = onCall(
   {
@@ -140,6 +147,7 @@ exports.askGemini = onCall(
             name: p.name.trim(),
             area: typeof p.area === "string" ? p.area.trim() : "",
             why: typeof p.why === "string" ? p.why.trim() : "",
+            category: typeof p.category === "string" ? p.category.trim() : "",
           }))
           .slice(0, 8);
       }
@@ -147,6 +155,21 @@ exports.askGemini = onCall(
       logger.warn("Răspuns Gemini non-JSON, returnez textul brut.");
     }
 
-    return {text: answer, places};
+    // Token-ii vin din usageMetadata-ul Gemini; ii trimitem la client doar
+    // pentru logarea experimentului. Daca lipsesc, trimitem null.
+    const usage = json.usageMetadata || {};
+    return {
+      text: answer,
+      places,
+      promptTokens:
+        typeof usage.promptTokenCount === "number" ?
+          usage.promptTokenCount :
+          null,
+      responseTokens:
+        typeof usage.candidatesTokenCount === "number" ?
+          usage.candidatesTokenCount :
+          null,
+      model: MODEL,
+    };
   },
 );

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -53,6 +54,23 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   // conversația, care crește nelimitat. ~12 mesaje = ~6 schimburi, suficient
   // pentru continuitate fără să cărăm tot firul.
   static const int _maxHistoryMessages = 12;
+
+  // Modelul folosit de Cloud Function (askGemini). Îl logăm în ai_logs ca să
+  // știm pe ce model s-a măsurat experimentul; trebuie să rămână sincron cu
+  // MODEL din functions/index.js.
+  static const String _geminiModel = 'gemini-2.5-flash';
+
+  // Tipuri Google Places prea generice ca să spună ceva despre gust — apar la
+  // aproape orice loc, așa că le excludem din profilul de gusturi ca top-ul să
+  // reflecte categoriile care chiar diferențiază (muzeu, parc, biserică...).
+  static const Set<String> _genericTypes = {
+    'point_of_interest',
+    'establishment',
+    'premise',
+    'geocode',
+    'political',
+    'tourist_attraction',
+  };
 
   static const String _googleMapsApiKey = String.fromEnvironment(
     'GOOGLE_MAPS_API_KEY',
@@ -233,6 +251,9 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     _scrollToBottom();
 
     final result = await _callGemini();
+    // Logăm fiecare apel (fără await, ca să nu blocăm UI-ul). Îl punem înaintea
+    // verificării 'mounted' ca să existe un document chiar dacă userul iese.
+    unawaited(_logInteraction(prompt: trimmed, result: result));
     if (!mounted) return;
     if (result.text != null) {
       final aiMessage = _ChatMessage(text: result.text!, isUser: false);
@@ -344,15 +365,37 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     if (user == null) return '';
 
     final location = await _fetchLocationContext();
-    final favorites = await _readPlaceNames(user.uid, 'favorites', 'updatedAt');
-    final visited = await _readPlaceNames(user.uid, 'visited', 'visitedAt');
+    final favorites = await _readPlaceEntries(user.uid, 'favorites', 'updatedAt');
+    final visited = await _readPlaceEntries(user.uid, 'visited', 'visitedAt');
 
-    if (location.isEmpty && favorites.isEmpty && visited.isEmpty) return '';
+    // Profil de gusturi: numărăm tipurile Google Places din favorite + vizitate
+    // și păstrăm primele 5 categorii după frecvență (ignorând tipurile generice).
+    final categoryCounts = <String, int>{};
+    for (final entry in [...favorites, ...visited]) {
+      for (final type in entry.types) {
+        if (_genericTypes.contains(type)) continue;
+        categoryCounts[type] = (categoryCounts[type] ?? 0) + 1;
+      }
+    }
+    final topCategories = categoryCounts.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    final top5 = topCategories.take(5).toList();
+
+    // Până la 8 nume salvate recent (favorite întâi, apoi vizitate), fără dubluri.
+    final recentNames = <String>[];
+    for (final entry in [...favorites, ...visited]) {
+      if (entry.name.isEmpty || recentNames.contains(entry.name)) continue;
+      recentNames.add(entry.name);
+      if (recentNames.length >= 8) break;
+    }
+
+    if (location.isEmpty && top5.isEmpty && recentNames.isEmpty) return '';
 
     final buffer = StringBuffer();
     if (_english) {
       buffer.write(
-        '\n\nUser personalization context — use it to tailor every recommendation:',
+        '\n\nUser personalization context — use it to silently tailor every '
+        'recommendation. Do NOT mention these preferences explicitly to the user.',
       );
       if (location.isNotEmpty) {
         buffer.write(
@@ -362,22 +405,25 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
           'destinations too far for their time budget.',
         );
       }
-      if (favorites.isNotEmpty) {
+      if (top5.isNotEmpty) {
+        final formatted = top5.map((e) => '${e.key} (${e.value})').join(', ');
         buffer.write(
-          '\n- Places the user saved as favorites: ${favorites.join(", ")}. '
-          'Do NOT recommend these same places again; infer the tastes they reveal '
-          '(type of place, region, atmosphere) and suggest new destinations that match.',
+          '\n- Taste profile (place categories the user saves or visits most, '
+          'with counts): $formatted. Infer the tastes these reveal and prioritize '
+          'new destinations that match them.',
         );
       }
-      if (visited.isNotEmpty) {
+      if (recentNames.isNotEmpty) {
         buffer.write(
-          '\n- Places the user already visited: ${visited.join(", ")}. '
-          'Avoid recommending these again and prioritize fresh suggestions.',
+          '\n- Places the user recently saved or visited: ${recentNames.join(", ")}. '
+          'Do NOT recommend these same places again; suggest fresh ones instead.',
         );
       }
     } else {
       buffer.write(
-        '\n\nContext de personalizare despre utilizator — folosește-l ca să adaptezi fiecare recomandare:',
+        '\n\nContext de personalizare despre utilizator — folosește-l ca să '
+        'adaptezi discret fiecare recomandare. NU menționa explicit aceste '
+        'preferințe utilizatorului.',
       );
       if (location.isNotEmpty) {
         buffer.write(
@@ -387,29 +433,30 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
           'și nu sugera destinații prea îndepărtate pentru timpul lui.',
         );
       }
-      if (favorites.isNotEmpty) {
+      if (top5.isNotEmpty) {
+        final formatted = top5.map((e) => '${e.key} (${e.value})').join(', ');
         buffer.write(
-          '\n- Locuri salvate la favorite: ${favorites.join(", ")}. '
-          'NU recomanda din nou aceleași locuri; deduce preferințele pe care le arată '
-          '(tipul locului, regiunea, atmosfera) și sugerează destinații noi care se potrivesc.',
+          '\n- Profil de gusturi (categoriile de locuri pe care le salvează sau '
+          'vizitează cel mai des, cu numărul de apariții): $formatted. Deduce '
+          'preferințele pe care le arată și prioritizează destinații noi care se potrivesc.',
         );
       }
-      if (visited.isNotEmpty) {
+      if (recentNames.isNotEmpty) {
         buffer.write(
-          '\n- Locuri deja vizitate: ${visited.join(", ")}. '
-          'Evită să le recomanzi din nou și prioritizează sugestii noi.',
+          '\n- Locuri salvate sau vizitate recent: ${recentNames.join(", ")}. '
+          'NU recomanda din nou aceleași locuri; sugerează altele noi.',
         );
       }
     }
     return buffer.toString();
   }
 
-  Future<List<String>> _readPlaceNames(
+  Future<List<({String name, List<String> types})>> _readPlaceEntries(
     String uid,
     String collection,
     String orderField,
   ) async {
-    final names = <String>[];
+    final entries = <({String name, List<String> types})>[];
     try {
       final snapshot = await FirebaseFirestore.instance
           .collection('users')
@@ -421,12 +468,14 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       for (final doc in snapshot.docs) {
         final data = doc.data();
         final name = data['name']?.toString().trim() ?? '';
-        if (name.isEmpty) continue;
-        final subtitle = data['subtitle']?.toString().trim() ?? '';
-        names.add(subtitle.isEmpty ? name : '$name ($subtitle)');
+        final rawTypes = data['types'];
+        final types = rawTypes is List
+            ? rawTypes.map((e) => e.toString()).toList()
+            : <String>[];
+        entries.add((name: name, types: types));
       }
     } catch (_) {}
-    return names;
+    return entries;
   }
 
   // Locația curentă pentru contextul AI. Returnează o expresie gata de inserat
@@ -518,10 +567,11 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     }
   }
 
-  Future<
-    ({String? text, List<({String name, String area})> places, String? error})
-  >
-  _callGemini() async {
+  Future<_GeminiResult> _callGemini() async {
+    // Construim contextul ÎNAINTE de cronometru: vrem ca latencyMs să măsoare
+    // doar apelul către funcție/Gemini, nu și citirile din Firestore/locație.
+    final contextUsed = await _buildUserContext();
+    final stopwatch = Stopwatch();
     try {
       // _messages conține deja întreaga conversație, inclusiv mesajul tocmai
       // trimis de utilizator (adăugat în _sendMessage), așa că NU îl mai adăugăm
@@ -549,7 +599,7 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         contents.removeAt(0);
       }
 
-      final systemInstruction = _systemPrompt + await _buildUserContext();
+      final systemInstruction = _systemPrompt + contextUsed;
 
       // Apelul nu mai conține cheia API. Cloud Function-ul autentificat
       // (askGemini) o ține pe server și vorbește el cu Gemini.
@@ -558,21 +608,32 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
             'askGemini',
             options: HttpsCallableOptions(timeout: const Duration(seconds: 30)),
           );
+      stopwatch.start();
       final response = await callable.call<Map<String, dynamic>>({
         'systemInstruction': systemInstruction,
         'contents': contents,
       });
+      stopwatch.stop();
+
+      final promptTokens = _asInt(response.data['promptTokens']);
+      final responseTokens = _asInt(response.data['responseTokens']);
 
       final text = response.data['text']?.toString();
       if (text == null || text.isEmpty) {
-        return (
+        return _GeminiResult(
           text: null,
-          places: const <({String name, String area})>[],
+          places: const [],
           error: 'Răspuns gol de la asistent.',
+          contextUsed: contextUsed,
+          latencyMs: stopwatch.elapsedMilliseconds,
+          promptTokens: promptTokens,
+          responseTokens: responseTokens,
+          recommendedCategories: null,
         );
       }
       final rawPlaces = response.data['places'];
       final places = <({String name, String area})>[];
+      final categories = <String>[];
       if (rawPlaces is List) {
         for (final item in rawPlaces) {
           if (item is Map) {
@@ -580,25 +641,85 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
             if (name.isEmpty) continue;
             final area = item['area']?.toString().trim() ?? '';
             places.add((name: name, area: area));
+            final category = item['category']?.toString().trim() ?? '';
+            if (category.isNotEmpty) categories.add(category);
           }
         }
       }
-      return (text: text, places: places, error: null);
+      return _GeminiResult(
+        text: text,
+        places: places,
+        error: null,
+        contextUsed: contextUsed,
+        latencyMs: stopwatch.elapsedMilliseconds,
+        promptTokens: promptTokens,
+        responseTokens: responseTokens,
+        recommendedCategories: categories.isEmpty ? null : categories,
+      );
     } on FirebaseFunctionsException catch (e) {
+      if (stopwatch.isRunning) stopwatch.stop();
       // Includem și codul (not-found, unauthenticated, unavailable...) ca să fie
       // ușor de diagnosticat. 'not-found' = funcția nu e deployată / regiune greșită.
       final detail = e.message ?? 'fără detalii';
-      return (
+      return _GeminiResult(
         text: null,
-        places: const <({String name, String area})>[],
+        places: const [],
         error: 'Eroare asistent [${e.code}]: $detail',
+        contextUsed: contextUsed,
+        latencyMs: stopwatch.elapsedMilliseconds,
+        promptTokens: null,
+        responseTokens: null,
+        recommendedCategories: null,
       );
     } catch (e) {
-      return (
+      if (stopwatch.isRunning) stopwatch.stop();
+      return _GeminiResult(
         text: null,
-        places: const <({String name, String area})>[],
+        places: const [],
         error: 'Excepție: $e',
+        contextUsed: contextUsed,
+        latencyMs: stopwatch.elapsedMilliseconds,
+        promptTokens: null,
+        responseTokens: null,
+        recommendedCategories: null,
       );
+    }
+  }
+
+  int? _asInt(Object? value) {
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    if (value is String) return int.tryParse(value);
+    return null;
+  }
+
+  // Logăm fiecare apel AI într-o colecție separată pentru analiza experimentului.
+  // Best-effort: rulează fără await (nu blochează UI-ul) și înghite erorile.
+  Future<void> _logInteraction({
+    required String prompt,
+    required _GeminiResult result,
+  }) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+    try {
+      await FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.uid)
+          .collection('ai_logs')
+          .add({
+            'timestamp': FieldValue.serverTimestamp(),
+            'condition': _withContext,
+            'prompt': prompt,
+            'response': result.text ?? result.error ?? '',
+            'contextUsed': result.contextUsed,
+            'latencyMs': result.latencyMs,
+            'promptTokens': result.promptTokens,
+            'responseTokens': result.responseTokens,
+            'recommendedCategories': result.recommendedCategories,
+            'model': _geminiModel,
+          });
+    } catch (_) {
+      // Logare best-effort: dacă pică, nu deranjăm utilizatorul.
     }
   }
 
@@ -984,6 +1105,27 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       ),
     );
   }
+}
+
+class _GeminiResult {
+  const _GeminiResult({
+    required this.text,
+    required this.places,
+    required this.error,
+    required this.contextUsed,
+    required this.latencyMs,
+    required this.promptTokens,
+    required this.responseTokens,
+    required this.recommendedCategories,
+  });
+  final String? text;
+  final List<({String name, String area})> places;
+  final String? error;
+  final String contextUsed;
+  final int latencyMs;
+  final int? promptTokens;
+  final int? responseTokens;
+  final List<String>? recommendedCategories;
 }
 
 class _ChatMessage {
