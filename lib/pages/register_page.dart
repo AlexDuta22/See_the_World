@@ -1,7 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import 'package:random_string/random_string.dart';
 
 import '../components/my_button.dart';
 import '../components/my_textfield.dart';
@@ -54,18 +53,13 @@ class _RegisterPageState extends State<RegisterPage> {
           message: 'User creation failed.',
         );
       }
-      final randomId = randomAlphaNumeric(10);
       await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
-        'id': randomId,
         'name': nameController.text.trim(),
         'email': emailController.text.trim(),
         'createdAt': FieldValue.serverTimestamp(),
       });
-      await SharedpreferenceHelper().saveUserId(randomId);
       await SharedpreferenceHelper()
           .saveUserDisplayName(nameController.text.trim());
-      await SharedpreferenceHelper()
-          .saveUserEmail(emailController.text.trim());
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(

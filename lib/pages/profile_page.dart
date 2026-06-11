@@ -7,7 +7,6 @@ import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import '../widgets/app_bottom_nav.dart';
 import 'ai_assistant_page.dart';
@@ -15,6 +14,7 @@ import 'favorite_places_page.dart';
 import 'home_page.dart';
 import 'offline_tours_page.dart';
 import '../services/app_theme.dart';
+import '../services/shared_pref.dart';
 
 class ProfilePage extends StatefulWidget {
   const ProfilePage({super.key});
@@ -24,8 +24,6 @@ class ProfilePage extends StatefulWidget {
 }
 
 class _ProfilePageState extends State<ProfilePage> {
-  static const String _userNameKey = 'USERNAMEKEY';
-
   // Configurare EmailJS (gratis, fără server). Completează cu valorile din
   // contul tău de pe emailjs.com — nu sunt secrete, pot sta în client:
   //   Service ID  → Email Services
@@ -48,10 +46,10 @@ class _ProfilePageState extends State<ProfilePage> {
   }
 
   Future<void> _loadCachedProfile() async {
-    final prefs = await SharedPreferences.getInstance();
+    final name = await SharedpreferenceHelper().getUserDisplayName();
     if (!mounted) return;
     setState(() {
-      _cachedDisplayName = prefs.getString(_userNameKey) ?? '';
+      _cachedDisplayName = name ?? '';
     });
   }
 
@@ -65,7 +63,7 @@ class _ProfilePageState extends State<ProfilePage> {
           TextButton(
             onPressed: () async {
               await FirebaseAuth.instance.signOut();
-              if (!mounted) return;
+              if (!context.mounted) return;
               _showSnack('Signed out.');
               Navigator.of(context).popUntil((route) => route.isFirst);
             },

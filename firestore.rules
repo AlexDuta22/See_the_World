@@ -10,10 +10,10 @@ service cloud.firestore {
       allow read, write: if request.auth != null;
     }
 
-    // Profilul unui utilizator. Citire pentru orice utilizator autentificat,
-    // pentru ca login-ul cauta documentul dupa email; scriere doar de proprietar.
+    // Profilul unui utilizator. Citire si scriere doar de proprietar: fiecare
+    // citeste documentul propriu dupa uid, nu mai cautam dupa email.
     match /users/{userId} {
-      allow read: if request.auth != null;
+      allow read: if request.auth != null && request.auth.uid == userId;
       allow write: if request.auth != null && request.auth.uid == userId;
 
       // Datele personale (favorite, vizitate) raman strict ale proprietarului.

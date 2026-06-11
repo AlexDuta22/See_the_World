@@ -3,7 +3,6 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:flutter_facebook_auth/flutter_facebook_auth.dart';
-import 'package:random_string/random_string.dart';
 import 'package:see_the_world/components/my_textfield.dart';
 
 import '../components/my_button.dart';
@@ -60,26 +59,16 @@ class _LoginPageState extends State<LoginPage> {
       // e doar cache și nu trebuie să mai țină utilizatorul pe ecranul de loading.
       dismissLoading();
 
-      final querySnapshot = await FirebaseFirestore.instance
+      // Suntem deja autentificați, așa că citim direct documentul nostru după uid
+      // (nu mai e nevoie de un query după email). E doar cache pentru numele afișat.
+      final doc = await FirebaseFirestore.instance
           .collection('users')
-          .where('email', isEqualTo: emailController.text.trim())
-          .limit(1)
+          .doc(FirebaseAuth.instance.currentUser!.uid)
           .get();
-      String myname = '';
-      String myid = '';
-      if (querySnapshot.docs.isNotEmpty) {
-        final data = querySnapshot.docs.first.data();
-        myname = data['name']?.toString() ?? '';
-        myid = data['id']?.toString() ?? '';
-      }
+      final myname = doc.data()?['name']?.toString() ?? '';
       if (myname.isNotEmpty) {
         await SharedpreferenceHelper().saveUserDisplayName(myname);
       }
-      if (myid.isNotEmpty) {
-        await SharedpreferenceHelper().saveUserId(myid);
-      }
-      await SharedpreferenceHelper()
-          .saveUserEmail(emailController.text.trim());
     } on FirebaseAuthException catch (e) {
       dismissLoading();
       // Give clearer feedback when credentials are wrong so the user can retry.
@@ -97,8 +86,8 @@ class _LoginPageState extends State<LoginPage> {
 
   // Un login social (Google/Facebook) creează contul de Auth, dar NU și
   // documentul din `users` — pe care înregistrarea pe email îl scrie explicit.
-  // Restul aplicației (profil, favorite, id-ul intern din SharedPreferences) se
-  // bazează pe el, așa că îl creăm la primul login social și-l reutilizăm apoi.
+  // Profilul (nume, foto) se bazează pe el, așa că îl creăm la primul login
+  // social și-l reutilizăm apoi.
   Future<void> _syncUserProfile(User? user) async {
     if (user == null) return;
     final docRef =
@@ -111,24 +100,15 @@ class _LoginPageState extends State<LoginPage> {
         : (email.contains('@') ? email.split('@').first : 'Traveler');
     final photoUrl = user.photoURL?.trim() ?? '';
 
-    String id;
     String name;
     if (snapshot.exists) {
       final data = snapshot.data() ?? <String, dynamic>{};
-      id = data['id']?.toString() ?? '';
       name = (data['name']?.toString().trim().isNotEmpty ?? false)
           ? data['name'].toString().trim()
           : displayName;
-      if (id.isEmpty) {
-        // Document vechi/incomplet: completăm doar id-ul, fără să-l atingem pe rest.
-        id = randomAlphaNumeric(10);
-        await docRef.set({'id': id}, SetOptions(merge: true));
-      }
     } else {
-      id = randomAlphaNumeric(10);
       name = displayName;
       await docRef.set({
-        'id': id,
         'name': name,
         'email': email,
         if (photoUrl.isNotEmpty) 'photoUrl': photoUrl,
@@ -136,12 +116,8 @@ class _LoginPageState extends State<LoginPage> {
       });
     }
 
-    await SharedpreferenceHelper().saveUserId(id);
     if (name.isNotEmpty) {
       await SharedpreferenceHelper().saveUserDisplayName(name);
-    }
-    if (email.isNotEmpty) {
-      await SharedpreferenceHelper().saveUserEmail(email);
     }
   }
 
