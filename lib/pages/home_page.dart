@@ -67,6 +67,9 @@ class _HomePageState extends State<HomePage> {
   bool _showTourMarkers = false;
   Set<Polyline> _tourPolylines = {};
   Set<Marker> _aiMarkers = {};
+  // „Top places" luate de pe net (Google Places), nu din Firestore. Stratul de
+  // baza al hartii pana cand Discover preia cu locatia reala a utilizatorului.
+  Set<Marker> _topPlacesMarkers = {};
 
   // Discover pe harta: tema aleasa (null = Popular near you), profil, eticheta, raza
   DiscoverTheme? _selectedTheme;
@@ -112,8 +115,7 @@ class _HomePageState extends State<HomePage> {
     _ensureLocationPermission();
     _startCompass();
     _loadDirectionsApiKey();
-    _loadPlacesApiKey();
-    _seedTopPlacesIfEmpty();
+    _initTopPlaces();
     _loadOfflineTour();
     _loadPhotoMemories();
     aiMapPlacesRequest.addListener(_handleAiPlacesRequest);
@@ -132,6 +134,18 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
+    // Stratul de baza: top places de pe net; daca inca nu s-au incarcat dar avem
+    // turul offline, cadem pe el. Discover il inlocuieste cand e activ.
+    final baseMarkers = (_topPlacesMarkers.isEmpty && _offlinePlaces.isNotEmpty)
+        ? _markersFromOffline(_offlinePlaces)
+        : _topPlacesMarkers;
+    final mapMarkers = <Marker>{
+      ...(_proximityActive ? _nearbyMarkers : baseMarkers),
+      if (_showTourMarkers) ..._tourMarkers,
+      ..._searchMarkers,
+      ..._aiMarkers,
+      ..._photoMemoryMarkers,
+    };
     return Scaffold(
       resizeToAvoidBottomInset: false,
       appBar: AppBar(
@@ -151,40 +165,18 @@ class _HomePageState extends State<HomePage> {
       ),
       body: Stack(
         children: [
-          StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-            stream: FirebaseFirestore.instance
-                .collection('top_places')
-                .orderBy('name')
-                .snapshots(),
-            builder: (context, snapshot) {
-              final places = snapshot.data?.docs ?? [];
-              final useOffline =
-                  snapshot.data == null && _offlinePlaces.isNotEmpty;
-              final baseMarkers = useOffline
-                  ? _markersFromOffline(_offlinePlaces)
-                  : _markersFromPlaces(places);
-              final markers = _proximityActive ? _nearbyMarkers : baseMarkers;
-              final combinedMarkers = <Marker>{
-                ...markers,
-                if (_showTourMarkers) ..._tourMarkers,
-                ..._searchMarkers,
-                ..._aiMarkers,
-                ..._photoMemoryMarkers,
-              };
-              return GoogleMap(
-                style: isDark ? _nightMapStyle : null,
-                onMapCreated: (controller) {
-                  _mapController = controller;
-                  _centerOnUserInitial();
-                },
-                initialCameraPosition: _initialCameraPosition,
-                markers: combinedMarkers,
-                polylines: {..._polylines, ..._tourPolylines},
-                myLocationEnabled: _hasLocationPermission,
-                myLocationButtonEnabled: _hasLocationPermission,
-                compassEnabled: true,
-              );
+          GoogleMap(
+            style: isDark ? _nightMapStyle : null,
+            onMapCreated: (controller) {
+              _mapController = controller;
+              _centerOnUserInitial();
             },
+            initialCameraPosition: _initialCameraPosition,
+            markers: mapMarkers,
+            polylines: {..._polylines, ..._tourPolylines},
+            myLocationEnabled: _hasLocationPermission,
+            myLocationButtonEnabled: _hasLocationPermission,
+            compassEnabled: true,
           ),
           Positioned(
             top: 12,
@@ -431,43 +423,6 @@ class _HomePageState extends State<HomePage> {
     }
 
     _showSnack('No matching place found.');
-  }
-
-  Set<Marker> _markersFromPlaces(
-    List<QueryDocumentSnapshot<Map<String, dynamic>>> docs,
-  ) {
-    final markers = <Marker>{};
-    for (final doc in docs) {
-      final data = doc.data();
-      final name = data['name']?.toString();
-      final lat = data['lat'] is num ? (data['lat'] as num).toDouble() : null;
-      final lng = data['lng'] is num ? (data['lng'] as num).toDouble() : null;
-      if (name == null || name.isEmpty || lat == null || lng == null) {
-        continue;
-      }
-      final subtitle = data['subtitle']?.toString() ?? '';
-      final description = data['description']?.toString() ?? subtitle;
-      final imageUrl = _placePhotoUrls[doc.id] ??
-          data['imageUrl']?.toString() ?? '';
-      _ensurePlacePhoto(doc.id, name, lat, lng);
-      markers.add(
-        Marker(
-          markerId: MarkerId(doc.id),
-          position: LatLng(lat, lng),
-          infoWindow: InfoWindow(title: name),
-          onTap: () => _showPlaceDetails(
-            placeId: doc.id,
-            name: name,
-            subtitle: subtitle,
-            description: description,
-            imageUrl: imageUrl,
-            lat: lat,
-            lng: lng,
-          ),
-        ),
-      );
-    }
-    return markers;
   }
 
   Set<Marker> _markersFromOffline(List<_OfflinePlace> places) {
@@ -1306,6 +1261,8 @@ class _HomePageState extends State<HomePage> {
       await _mapController!.animateCamera(
         CameraUpdate.newLatLngZoom(target, 15),
       );
+      // recentram top places pe pozitia reala, cat timp Discover nu a preluat
+      if (!_proximityActive) await _loadPopularNearby(center: target);
       await _refreshDiscover();
       return true;
     } catch (_) {
@@ -1490,6 +1447,60 @@ class _HomePageState extends State<HomePage> {
           _placesApiKey = key;
         });
       }
+    } catch (_) {}
+  }
+
+  // Asiguram cheia Places, apoi incarcam top places de pe net.
+  Future<void> _initTopPlaces() async {
+    await _loadPlacesApiKey();
+    await _loadPopularNearby();
+  }
+
+  // Top places de pe net: atractiile populare din jur prin Google Places, nu cele
+  // 4 din Firestore. Centram pe ultima pozitie cunoscuta, altfel pe centrul hartii.
+  Future<void> _loadPopularNearby({LatLng? center}) async {
+    if (_placesApiKey.isEmpty) return;
+    // Centru: cel primit explicit (pozitia reala), altfel ultima pozitie
+    // cunoscuta, altfel centrul hartii.
+    var origin = center ?? _initialCameraPosition.target;
+    if (center == null) {
+      if (_lastPosition != null) {
+        origin = LatLng(_lastPosition!.latitude, _lastPosition!.longitude);
+      } else {
+        try {
+          final last = await Geolocator.getLastKnownPosition();
+          if (last != null) origin = LatLng(last.latitude, last.longitude);
+        } catch (_) {}
+      }
+    }
+    try {
+      final service = DiscoverService(placesApiKey: _placesApiKey);
+      final uid = FirebaseAuth.instance.currentUser?.uid;
+      final excluded = uid == null
+          ? <String>{}
+          : await service.visitedPlaceIds(uid);
+      var results = <DiscoverCandidate>[];
+      for (final radius in _discoverRadiusSteps) {
+        results = await service.fetchPopular(
+          lat: origin.latitude,
+          lng: origin.longitude,
+          radius: radius,
+          excludeIds: excluded,
+        );
+        if (results.isNotEmpty) break;
+      }
+      if (!mounted || results.isEmpty) return;
+      final places = results.map(
+        (c) => _NearbyPlace(
+          id: c.placeId,
+          name: c.name,
+          position: LatLng(c.lat, c.lng),
+          types: c.types,
+          theme: c.theme,
+          rating: c.rating,
+        ),
+      );
+      setState(() => _topPlacesMarkers = _buildNearbyMarkers(places));
     } catch (_) {}
   }
 
@@ -2047,101 +2058,6 @@ class _HomePageState extends State<HomePage> {
   {"featureType": "water", "elementType": "labels.text.stroke", "stylers": [{"color": "#17263c"}]}
 ]
 ''';
-
-  Future<void> _seedTopPlacesIfEmpty() async {
-    try {
-      final collection = FirebaseFirestore.instance.collection('top_places');
-      final snapshot = await collection.get();
-      final existingDocs =
-          <String, QueryDocumentSnapshot<Map<String, dynamic>>>{};
-      for (final doc in snapshot.docs) {
-        final name = doc.data()['name']?.toString().toLowerCase().trim() ?? '';
-        if (name.isEmpty || existingDocs.containsKey(name)) continue;
-        existingDocs[name] = doc;
-      }
-      final bastionDoc = existingDocs['bastionul maria theresia'];
-      if (bastionDoc != null) {
-        await collection.doc(bastionDoc.id).delete();
-        existingDocs.remove('bastionul maria theresia');
-      }
-      final cathedralDoc = existingDocs['catedrala mitropolitana'];
-      if (cathedralDoc != null) {
-        await collection.doc(cathedralDoc.id).update({
-          'lat': 45.75100975109226,
-          'lng': 21.22429104948917,
-        });
-      }
-      final seeds = <Map<String, dynamic>>[
-        {
-          'name': 'Piata Victoriei',
-          'subtitle': 'Timisoara city center',
-          'description':
-              'Piata Victoriei is Timisoara’s central square, lined with historic facades and opening to the Metropolitan Cathedral. It is a lively pedestrian area with cafes, events, and a strong architectural mix of Secession and Neoclassical styles.',
-          'imageUrl':
-              'https://lh3.googleusercontent.com/gps-cs-s/AG0ilSx-yWta5LSlmBlZcx4OyK0V_jIB-p3Sg5igodUekbVSZ21BLX4Ls4ci_pQZQIrjnow_UvOsLtSPGwbFYUCid2cysDYBJNn8k3k-L48uimJNIMkUUQ7cnHtWD9zchDZkIQI9uG8=w270-h312-n-k-no',
-          'lat': 45.7537,
-          'lng': 21.2257,
-        },
-        {
-          'name': 'Piata Unirii',
-          'subtitle': 'Historic square with baroque buildings',
-          'description':
-              'Piata Unirii is the baroque heart of Timisoara, known for its pastel buildings, cathedral, and elegant squareside terraces. The open plaza highlights the city’s Habsburg-era heritage and remains a popular gathering spot.',
-          'imageUrl':
-              'https://upload.wikimedia.org/wikipedia/commons/thumb/e/ef/Pia%C8%9Ba_Victoriei_Timi%C8%99oara.jpg/1200px-Pia%C8%9Ba_Victoriei_Timi%C8%99oara.jpg',
-          'lat': 45.7576,
-          'lng': 21.2296,
-        },
-        {
-          'name': 'Catedrala Mitropolitana',
-          'subtitle': 'Romanian Orthodox cathedral',
-          'description':
-              'The Metropolitan Cathedral is one of Timisoara’s most recognizable landmarks, featuring tall spires, richly decorated interiors, and a prominent position near the city center. It reflects Romanian Orthodox architecture and history.',
-          'imageUrl':
-              'https://dynamic-media-cdn.tripadvisor.com/media/photo-o/0e/09/40/bf/impresionante-architektur.jpg?w=1200&h=-1&s=1',
-          'lat': 45.75100975109226,
-          'lng': 21.22429104948917,
-        },
-        {
-          'name': 'Muzeul Satului Banatean',
-          'subtitle': 'Open-air museum of Banat village life',
-          'description':
-              'The Banat Village Museum is an open-air collection of traditional houses, workshops, and churches that recreate rural life in the Banat region. It offers a walk-through of local crafts, architecture, and everyday history.',
-          'imageUrl':
-              'https://upload.wikimedia.org/wikipedia/commons/a/a8/2023_-_Muzeul_Satului_B%C4%83n%C4%83%C8%9Bean_-_biserica_de_lemn_din_Topla%2C_Timi%C8%99_-_img_0.jpg',
-          'lat': 45.7794001339114,
-          'lng': 21.266045925406583,
-        },
-      ];
-      for (final place in seeds) {
-        final name = place['name']?.toString().toLowerCase().trim() ?? '';
-        if (name.isEmpty) continue;
-        final existingDoc = existingDocs[name];
-        if (existingDoc != null) {
-          final data = existingDoc.data();
-          final updates = <String, dynamic>{};
-          final subtitle = data['subtitle']?.toString().trim() ?? '';
-          final imageUrl = data['imageUrl']?.toString().trim() ?? '';
-          if (subtitle.isEmpty && place['subtitle'] != null) {
-            updates['subtitle'] = place['subtitle'];
-          }
-          if (place['description'] != null) {
-            updates['description'] = place['description'];
-          }
-          if (imageUrl.isEmpty && place['imageUrl'] != null) {
-            updates['imageUrl'] = place['imageUrl'];
-          }
-          if (updates.isNotEmpty) {
-            await collection.doc(existingDoc.id).update(updates);
-          }
-          continue;
-        }
-        await collection.add(place);
-      }
-    } catch (_) {
-      // Ignore seeding errors.
-    }
-  }
 
   Future<void> _loadOfflineTour() async {
     final prefs = await SharedPreferences.getInstance();
