@@ -49,5 +49,9 @@
 	<string>We use your location to show where you are on the map and nearby places.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>We use your camera to let you capture photos for tours and places.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>We save the photos you take to your gallery in a "See the World" album.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>We need photo library access to save your travel photos into a dedicated album.</string>
 </dict>
 </plist>

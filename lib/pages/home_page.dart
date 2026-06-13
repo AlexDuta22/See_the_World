@@ -13,6 +13,7 @@ import 'package:google_places_flutter/google_places_flutter.dart';
 import 'package:google_places_flutter/model/prediction.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:flutter_polyline_points/flutter_polyline_points.dart';
+import 'package:gal/gal.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
@@ -955,6 +956,7 @@ class _HomePageState extends State<HomePage> {
         picked: picked,
         filenamePrefix: 'capture',
       );
+      await _saveToGallery(saved.path);
 
       // pin la locatia curenta
       Position? pos = _lastPosition;
@@ -1524,9 +1526,7 @@ class _HomePageState extends State<HomePage> {
         picked: picked,
         filenamePrefix: 'memory_$placeId',
       );
-      try {} catch (_) {
-        // Ignore gallery save errors; local save still succeeds.
-      }
+      await _saveToGallery(saved.path);
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('memory_photo_$placeId', saved.path);
       await _recordVisitedPlace(
@@ -1581,6 +1581,21 @@ class _HomePageState extends State<HomePage> {
       '${dir.path}/${filenamePrefix}_${DateTime.now().millisecondsSinceEpoch}.jpg',
     );
     return File(picked.path).copy(target.path);
+  }
+
+  // Albumul din galeria telefonului unde punem pozele făcute în aplicație.
+  static const String _galleryAlbum = 'See the World';
+
+  // Copiem poza și în galerie, într-un album dedicat. Best-effort: dacă pică
+  // (permisiune refuzată etc.), salvarea locală + cloud rămân intacte.
+  Future<void> _saveToGallery(String path) async {
+    try {
+      if (!await Gal.hasAccess(toAlbum: true)) {
+        final granted = await Gal.requestAccess(toAlbum: true);
+        if (!granted) return;
+      }
+      await Gal.putImage(path, album: _galleryAlbum);
+    } catch (_) {}
   }
 
   Widget _buildLocalSearchField() {

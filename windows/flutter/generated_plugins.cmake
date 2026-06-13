@@ -10,6 +10,7 @@ list(APPEND FLUTTER_PLUGIN_LIST
   firebase_storage
   flutter_secure_storage_windows
   flutter_tts
+  gal
   geolocator_windows
   speech_to_text_windows
 )
