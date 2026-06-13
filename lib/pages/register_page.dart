@@ -34,6 +34,11 @@ class _RegisterPageState extends State<RegisterPage> {
       return;
     }
 
+    if (passwordController.text.length < 8) {
+      _showErrorMessage('Parola trebuie să aibă cel puțin 8 caractere.');
+      return;
+    }
+
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -60,10 +65,17 @@ class _RegisterPageState extends State<RegisterPage> {
       });
       await SharedpreferenceHelper()
           .saveUserDisplayName(nameController.text.trim());
+      // Email de verificare opțional: dacă trimiterea eșuează, nu blocăm
+      // înregistrarea și nici login-ul (verificarea rămâne neimpusă).
+      try {
+        await user.sendEmailVerification();
+      } catch (_) {}
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('Registered successfully.'),
+            content: Text(
+              'Registered successfully. Ți-am trimis un email de verificare.',
+            ),
             backgroundColor: Colors.green,
           ),
         );

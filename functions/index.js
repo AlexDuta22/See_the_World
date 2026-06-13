@@ -11,6 +11,11 @@
 const {onCall, HttpsError} = require("firebase-functions/v2/https");
 const {defineSecret} = require("firebase-functions/params");
 const logger = require("firebase-functions/logger");
+const admin = require("firebase-admin");
+
+// Admin SDK pentru contorul de rate limit. Îl inițializăm o singură dată; el
+// ocolește regulile Firestore, deci contorul nu are nevoie de firestore.rules.
+if (!admin.apps.length) admin.initializeApp();
 
 // Secret gestionat de Firebase/Google Secret Manager. Se setează o singură dată
 // din terminal (vezi README), nu apare niciodată în cod sau în repo:
@@ -19,6 +24,10 @@ const GEMINI_API_KEY = defineSecret("GEMINI_API_KEY");
 
 const MODEL = "gemini-2.5-flash";
 const REGION = "europe-west1";
+
+// Câte întrebări poate trimite un utilizator pe zi. Peste limită refuzăm
+// înainte de apelul (costisitor) către Gemini, ca să nu ne consume quota.
+const DAILY_LIMIT = 50;
 
 const RESPONSE_SCHEMA = {
   type: "OBJECT",
@@ -90,12 +99,38 @@ exports.askGemini = onCall(
       );
     }
 
+    // 2b. Rate limit zilnic per utilizator. Verificăm și incrementăm contorul
+    // ÎNAINTE de apelul către Gemini, ca depășirea limitei să oprească cererea
+    // costisitoare. Transaction-ul ține numărătoarea corectă la apeluri paralele.
+    const today = new Date().toISOString().slice(0, 10);
+    const quotaRef = admin
+      .firestore()
+      .collection("ai_quota")
+      .doc(request.auth.uid);
+    await admin.firestore().runTransaction(async (tx) => {
+      const snap = await tx.get(quotaRef);
+      const data = snap.data() || {};
+      const count = data.date === today ? data.count || 0 : 0;
+      if (count >= DAILY_LIMIT) {
+        throw new HttpsError(
+          "resource-exhausted",
+          "Ai atins limita zilnică de întrebări pentru asistent. " +
+            "Încearcă din nou mâine.",
+        );
+      }
+      tx.set(quotaRef, {date: today, count: count + 1});
+    });
+
     // 3. Apel către Gemini cu cheia care stă pe server (Node 20 are fetch global).
     const url =
       "https://generativelanguage.googleapis.com/v1beta/models/" +
       `${MODEL}:generateContent?key=${GEMINI_API_KEY.value()}`;
 
+    // Cronometrăm DOAR apelul Gemini (fără overhead-ul contorului de mai sus),
+    // ca metrica să reflecte latența pură a modelului.
     let response;
+    let geminiLatencyMs = null;
+    const t0 = Date.now();
     try {
       response = await fetch(url, {
         method: "POST",
@@ -113,6 +148,7 @@ exports.askGemini = onCall(
           },
         }),
       });
+      geminiLatencyMs = Date.now() - t0;
     } catch (err) {
       logger.error("Eroare de rețea către Gemini", err);
       throw new HttpsError("unavailable", "Nu am putut contacta Gemini.");
@@ -169,6 +205,7 @@ exports.askGemini = onCall(
         typeof usage.candidatesTokenCount === "number" ?
           usage.candidatesTokenCount :
           null,
+      geminiLatencyMs,
       model: MODEL,
     };
   },
