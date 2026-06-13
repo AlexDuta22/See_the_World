@@ -12,6 +12,8 @@ import 'package:http/http.dart' as http;
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 
+import '../services/discover_themes.dart';
+
 final ValueNotifier<List<AiMapPlace>> aiMapPlacesRequest =
     ValueNotifier<List<AiMapPlace>>(const []);
 
@@ -34,7 +36,10 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   bool _speechAvailable = false;
   bool _ttsEnabled = false;
   bool _english = false;
-  bool _withContext = true;
+  // Brațul experimentului: none = fără context, locationOnly = doar locație,
+  // full = locație + profil de gusturi. Trei brațe ca să putem izola aportul
+  // gusturilor (full − locationOnly) separat de cel al locației.
+  _ContextMode _contextMode = _ContextMode.full;
   String _partialText = '';
 
   // Locația curentă (reverse-geocodată) injectată în contextul AI, ca Gemini să
@@ -112,6 +117,30 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       'When recommending places, include what activities can be done there.';
 
   String get _systemPrompt => _english ? _systemPromptEn : _systemPromptRo;
+
+  IconData get _contextModeIcon {
+    switch (_contextMode) {
+      case _ContextMode.none:
+        return Icons.person_off;
+      case _ContextMode.locationOnly:
+        return Icons.location_on;
+      case _ContextMode.full:
+        return Icons.person_pin_circle;
+    }
+  }
+
+  String get _contextModeLabel {
+    switch (_contextMode) {
+      case _ContextMode.none:
+        return _english ? 'Context: none' : 'Context: fără';
+      case _ContextMode.locationOnly:
+        return _english ? 'Context: location only' : 'Context: doar locație';
+      case _ContextMode.full:
+        return _english
+            ? 'Context: location + taste'
+            : 'Context: locație + gusturi';
+    }
+  }
 
   static const String _welcomeRo =
       'Salut! Sunt asistentul tău de călătorie AI. 🗺️\n\n'
@@ -359,10 +388,13 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     }
   }
 
-  Future<String> _buildUserContext() async {
-    if (!_withContext) return '';
+  // Colectează semnalele utilizatorului (locație + profil de gusturi + nume
+  // recente) INDEPENDENT de brațul experimentului. Le calculăm mereu ca să le
+  // putem loga și când nu sunt injectate — fără asta nu avem cum măsura alinierea
+  // pe brațul fără context.
+  Future<_UserSignals> _collectSignals() async {
     final user = FirebaseAuth.instance.currentUser;
-    if (user == null) return '';
+    if (user == null) return _UserSignals.empty;
 
     final location = await _fetchLocationContext();
     final favorites = await _readPlaceEntries(user.uid, 'favorites', 'updatedAt');
@@ -377,9 +409,12 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         categoryCounts[type] = (categoryCounts[type] ?? 0) + 1;
       }
     }
-    final topCategories = categoryCounts.entries.toList()
+    final ranked = categoryCounts.entries.toList()
       ..sort((a, b) => b.value.compareTo(a.value));
-    final top5 = topCategories.take(5).toList();
+    final topCategories = ranked
+        .take(5)
+        .map((e) => (type: e.key, count: e.value))
+        .toList();
 
     // Până la 8 nume salvate recent (favorite întâi, apoi vizitate), fără dubluri.
     final recentNames = <String>[];
@@ -389,7 +424,22 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       if (recentNames.length >= 8) break;
     }
 
-    if (location.isEmpty && top5.isEmpty && recentNames.isEmpty) return '';
+    return _UserSignals(
+      location: location,
+      topCategories: topCategories,
+      recentNames: recentNames,
+      signalsCount: favorites.length + visited.length,
+    );
+  }
+
+  // Textul de personalizare injectat în prompt, în funcție de brațul ales:
+  // none → nimic, locationOnly → doar locația, full → locație + gusturi + recente.
+  String _contextText(_UserSignals s) {
+    if (_contextMode == _ContextMode.none) return '';
+    final full = _contextMode == _ContextMode.full;
+    final hasTaste = full && s.topCategories.isNotEmpty;
+    final hasRecent = full && s.recentNames.isNotEmpty;
+    if (s.location.isEmpty && !hasTaste && !hasRecent) return '';
 
     final buffer = StringBuffer();
     if (_english) {
@@ -397,25 +447,26 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         '\n\nUser personalization context — use it to silently tailor every '
         'recommendation. Do NOT mention these preferences explicitly to the user.',
       );
-      if (location.isNotEmpty) {
+      if (s.location.isNotEmpty) {
         buffer.write(
-          '\n- The user is currently $location. Prioritize places near this '
+          '\n- The user is currently ${s.location}. Prioritize places near this '
           'location and reachable within the time the user says they have '
           'available; estimate realistic travel time and do not suggest '
           'destinations too far for their time budget.',
         );
       }
-      if (top5.isNotEmpty) {
-        final formatted = top5.map((e) => '${e.key} (${e.value})').join(', ');
+      if (hasTaste) {
+        final formatted =
+            s.topCategories.map((e) => '${e.type} (${e.count})').join(', ');
         buffer.write(
           '\n- Taste profile (place categories the user saves or visits most, '
           'with counts): $formatted. Infer the tastes these reveal and prioritize '
           'new destinations that match them.',
         );
       }
-      if (recentNames.isNotEmpty) {
+      if (hasRecent) {
         buffer.write(
-          '\n- Places the user recently saved or visited: ${recentNames.join(", ")}. '
+          '\n- Places the user recently saved or visited: ${s.recentNames.join(", ")}. '
           'Do NOT recommend these same places again; suggest fresh ones instead.',
         );
       }
@@ -425,25 +476,26 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         'adaptezi discret fiecare recomandare. NU menționa explicit aceste '
         'preferințe utilizatorului.',
       );
-      if (location.isNotEmpty) {
+      if (s.location.isNotEmpty) {
         buffer.write(
-          '\n- Utilizatorul se află acum $location. Prioritizează locuri '
+          '\n- Utilizatorul se află acum ${s.location}. Prioritizează locuri '
           'apropiate de această poziție și care pot fi atinse în timpul pe care '
           'spune că îl are la dispoziție; estimează realist timpul de deplasare '
           'și nu sugera destinații prea îndepărtate pentru timpul lui.',
         );
       }
-      if (top5.isNotEmpty) {
-        final formatted = top5.map((e) => '${e.key} (${e.value})').join(', ');
+      if (hasTaste) {
+        final formatted =
+            s.topCategories.map((e) => '${e.type} (${e.count})').join(', ');
         buffer.write(
           '\n- Profil de gusturi (categoriile de locuri pe care le salvează sau '
           'vizitează cel mai des, cu numărul de apariții): $formatted. Deduce '
           'preferințele pe care le arată și prioritizează destinații noi care se potrivesc.',
         );
       }
-      if (recentNames.isNotEmpty) {
+      if (hasRecent) {
         buffer.write(
-          '\n- Locuri salvate sau vizitate recent: ${recentNames.join(", ")}. '
+          '\n- Locuri salvate sau vizitate recent: ${s.recentNames.join(", ")}. '
           'NU recomanda din nou aceleași locuri; sugerează altele noi.',
         );
       }
@@ -570,7 +622,9 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   Future<_GeminiResult> _callGemini() async {
     // Construim contextul ÎNAINTE de cronometru: vrem ca latencyMs să măsoare
     // doar apelul către funcție/Gemini, nu și citirile din Firestore/locație.
-    final contextUsed = await _buildUserContext();
+    // Semnalele se colectează mereu (pentru logare); doar injectarea ține de braț.
+    final signals = await _collectSignals();
+    final contextUsed = _contextText(signals);
     final stopwatch = Stopwatch();
     try {
       // _messages conține deja întreaga conversație, inclusiv mesajul tocmai
@@ -617,6 +671,7 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
 
       final promptTokens = _asInt(response.data['promptTokens']);
       final responseTokens = _asInt(response.data['responseTokens']);
+      final geminiLatencyMs = _asInt(response.data['geminiLatencyMs']);
 
       final text = response.data['text']?.toString();
       if (text == null || text.isEmpty) {
@@ -625,24 +680,32 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
           places: const [],
           error: 'Răspuns gol de la asistent.',
           contextUsed: contextUsed,
+          signals: signals,
           latencyMs: stopwatch.elapsedMilliseconds,
+          geminiLatencyMs: geminiLatencyMs,
           promptTokens: promptTokens,
           responseTokens: responseTokens,
           recommendedCategories: null,
+          recommendedPlaces: const [],
         );
       }
       final rawPlaces = response.data['places'];
       final places = <({String name, String area})>[];
       final categories = <String>[];
+      final recommendedPlaces =
+          <({String name, String area, String category})>[];
       if (rawPlaces is List) {
         for (final item in rawPlaces) {
           if (item is Map) {
             final name = item['name']?.toString().trim() ?? '';
             if (name.isEmpty) continue;
             final area = item['area']?.toString().trim() ?? '';
-            places.add((name: name, area: area));
             final category = item['category']?.toString().trim() ?? '';
+            places.add((name: name, area: area));
             if (category.isNotEmpty) categories.add(category);
+            recommendedPlaces.add(
+              (name: name, area: area, category: category),
+            );
           }
         }
       }
@@ -651,10 +714,13 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         places: places,
         error: null,
         contextUsed: contextUsed,
+        signals: signals,
         latencyMs: stopwatch.elapsedMilliseconds,
+        geminiLatencyMs: geminiLatencyMs,
         promptTokens: promptTokens,
         responseTokens: responseTokens,
         recommendedCategories: categories.isEmpty ? null : categories,
+        recommendedPlaces: recommendedPlaces,
       );
     } on FirebaseFunctionsException catch (e) {
       if (stopwatch.isRunning) stopwatch.stop();
@@ -666,10 +732,13 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         places: const [],
         error: 'Eroare asistent [${e.code}]: $detail',
         contextUsed: contextUsed,
+        signals: signals,
         latencyMs: stopwatch.elapsedMilliseconds,
+        geminiLatencyMs: null,
         promptTokens: null,
         responseTokens: null,
         recommendedCategories: null,
+        recommendedPlaces: const [],
       );
     } catch (e) {
       if (stopwatch.isRunning) stopwatch.stop();
@@ -678,10 +747,13 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         places: const [],
         error: 'Excepție: $e',
         contextUsed: contextUsed,
+        signals: signals,
         latencyMs: stopwatch.elapsedMilliseconds,
+        geminiLatencyMs: null,
         promptTokens: null,
         responseTokens: null,
         recommendedCategories: null,
+        recommendedPlaces: const [],
       );
     }
   }
@@ -693,6 +765,18 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     return null;
   }
 
+  // Id stabil derivat din prompt (FNV-1a), ca să grupăm la analiză apelurile pe
+  // același prompt din brațe diferite. String.hashCode nu e garantat stabil.
+  String _pairId(String prompt) {
+    final norm = prompt.trim().toLowerCase();
+    var hash = 0x811c9dc5;
+    for (final unit in norm.codeUnits) {
+      hash ^= unit;
+      hash = (hash * 0x01000193) & 0xFFFFFFFF;
+    }
+    return hash.toRadixString(16).padLeft(8, '0');
+  }
+
   // Logăm fiecare apel AI într-o colecție separată pentru analiza experimentului.
   // Best-effort: rulează fără await (nu blochează UI-ul) și înghite erorile.
   Future<void> _logInteraction({
@@ -702,20 +786,55 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
     try {
+      // Aducem profilul pe cele 6 teme Discover (aceeași taxonomie cu care
+      // mapăm recomandările mai jos), ca alinierea să se calculeze pe aceeași
+      // riglă pentru ambele laturi — totul local, fără apeluri Places.
+      final profileThemeCounts = <String, int>{};
+      for (final c in result.signals.topCategories) {
+        final theme = themeForTypes([c.type])?.name;
+        if (theme == null) continue;
+        profileThemeCounts[theme] = (profileThemeCounts[theme] ?? 0) + c.count;
+      }
       await FirebaseFirestore.instance
           .collection('users')
           .doc(user.uid)
           .collection('ai_logs')
           .add({
             'timestamp': FieldValue.serverTimestamp(),
-            'condition': _withContext,
+            // brațul experimentului. 'condition' rămâne bool (true doar la full)
+            // pentru compatibilitate; 'conditionLabel' dă brațul exact.
+            'condition': _contextMode == _ContextMode.full,
+            'conditionLabel': _contextMode.name,
+            // leagă apelurile pe același prompt între brațe (comparație împerecheată)
+            'pairId': _pairId(prompt),
             'prompt': prompt,
             'response': result.text ?? result.error ?? '',
             'contextUsed': result.contextUsed,
+            // profilul din clipa apelului, logat INDIFERENT de braț — fără el nu
+            // putem calcula alinierea pe brațele fără gusturi injectate.
+            'profileCategories': result.signals.topCategories
+                .map((c) => {'type': c.type, 'count': c.count})
+                .toList(),
+            // același profil, dar agregat pe teme (history/nature/food/...)
+            'profileThemes': profileThemeCounts.entries
+                .map((e) => {'theme': e.key, 'count': e.value})
+                .toList(),
+            'signalsCount': result.signals.signalsCount,
+            'hasLocation': result.signals.location.isNotEmpty,
             'latencyMs': result.latencyMs,
+            'geminiLatencyMs': result.geminiLatencyMs,
             'promptTokens': result.promptTokens,
             'responseTokens': result.responseTokens,
             'recommendedCategories': result.recommendedCategories,
+            'recommendedPlaces': result.recommendedPlaces
+                .map((p) => {
+                      'name': p.name,
+                      'area': p.area,
+                      'category': p.category,
+                      // tema derivată din categorie, aceeași riglă ca profileThemes
+                      'theme': themeForTypes([p.category])?.name,
+                    })
+                .toList(),
             'model': _geminiModel,
           });
     } catch (_) {
@@ -948,30 +1067,17 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
             ),
           ),
           IconButton(
-            icon: Icon(
-              _withContext ? Icons.person_pin_circle : Icons.person_off,
-            ),
-            tooltip: _withContext
-                ? (_english
-                      ? 'Personal context: on'
-                      : 'Context personal: pornit')
-                : (_english
-                      ? 'Personal context: off'
-                      : 'Context personal: oprit'),
+            icon: Icon(_contextModeIcon),
+            tooltip: _contextModeLabel,
             onPressed: () {
-              setState(() => _withContext = !_withContext);
+              setState(() {
+                _contextMode = _ContextMode.values[(_contextMode.index + 1) %
+                    _ContextMode.values.length];
+              });
               ScaffoldMessenger.of(context).showSnackBar(
                 SnackBar(
                   duration: const Duration(seconds: 1),
-                  content: Text(
-                    _withContext
-                        ? (_english
-                              ? 'Personal context on'
-                              : 'Context personal pornit')
-                        : (_english
-                              ? 'Personal context off'
-                              : 'Context personal oprit'),
-                  ),
+                  content: Text(_contextModeLabel),
                 ),
               );
             },
@@ -1107,25 +1213,66 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   }
 }
 
+// Brațele experimentului de personalizare. Ordinea contează: butonul ciclează
+// prin ele, iar full − locationOnly izolează aportul profilului de gusturi.
+enum _ContextMode { none, locationOnly, full }
+
+// Semnalele utilizatorului, colectate independent de braț ca să le putem loga
+// la fiecare apel (inclusiv pe brațul fără context).
+class _UserSignals {
+  const _UserSignals({
+    required this.location,
+    required this.topCategories,
+    required this.recentNames,
+    required this.signalsCount,
+  });
+
+  final String location;
+  // top-5 categorii (tip Google Places + nr. apariții) din favorite + vizitate
+  final List<({String type, int count})> topCategories;
+  final List<String> recentNames;
+  // câte locuri (favorite + vizitate) au stat la baza profilului — pentru
+  // analiza efectului în funcție de bogăția istoricului / cold-start
+  final int signalsCount;
+
+  static const empty = _UserSignals(
+    location: '',
+    topCategories: [],
+    recentNames: [],
+    signalsCount: 0,
+  );
+}
+
 class _GeminiResult {
   const _GeminiResult({
     required this.text,
     required this.places,
     required this.error,
     required this.contextUsed,
+    required this.signals,
     required this.latencyMs,
+    required this.geminiLatencyMs,
     required this.promptTokens,
     required this.responseTokens,
     required this.recommendedCategories,
+    required this.recommendedPlaces,
   });
   final String? text;
   final List<({String name, String area})> places;
   final String? error;
   final String contextUsed;
+  // Profilul/semnalele din clipa apelului, logate indiferent de braț.
+  final _UserSignals signals;
   final int latencyMs;
+  // Latența pură Gemini măsurată pe server (geminiLatencyMs din răspuns), separat
+  // de round-trip-ul total. Null dacă apelul a eșuat înainte de răspuns.
+  final int? geminiLatencyMs;
   final int? promptTokens;
   final int? responseTokens;
   final List<String>? recommendedCategories;
+  // Locurile recomandate structurate (nume + zonă + categorie împreună), pentru
+  // alinierea/noutatea din analiză, nu doar lista plată de categorii.
+  final List<({String name, String area, String category})> recommendedPlaces;
 }
 
 class _ChatMessage {
