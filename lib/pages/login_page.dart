@@ -1,5 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:flutter_facebook_auth/flutter_facebook_auth.dart';
@@ -142,16 +143,24 @@ class _LoginPageState extends State<LoginPage> {
     );
     loadingVisible = true;
     try {
-      await _ensureGoogleInitialized();
-      final GoogleSignInAccount googleUser =
-          await GoogleSignIn.instance.authenticate();
-      final GoogleSignInAuthentication googleAuth =
-          googleUser.authentication;
-      final credential = GoogleAuthProvider.credential(
-        idToken: googleAuth.idToken,
-      );
-      final userCredential =
-          await FirebaseAuth.instance.signInWithCredential(credential);
+      final UserCredential userCredential;
+      if (kIsWeb) {
+        // pe web folosim popup-ul Firebase; google_sign_in nu suportă web
+        userCredential = await FirebaseAuth.instance.signInWithPopup(
+          GoogleAuthProvider(),
+        );
+      } else {
+        await _ensureGoogleInitialized();
+        final GoogleSignInAccount googleUser =
+            await GoogleSignIn.instance.authenticate();
+        final GoogleSignInAuthentication googleAuth = googleUser.authentication;
+        final credential = GoogleAuthProvider.credential(
+          idToken: googleAuth.idToken,
+        );
+        userCredential = await FirebaseAuth.instance.signInWithCredential(
+          credential,
+        );
+      }
       await _syncUserProfile(userCredential.user);
       dismissLoading();
     } on GoogleSignInException catch (e) {
@@ -162,6 +171,10 @@ class _LoginPageState extends State<LoginPage> {
       _showErrorMessage(e.description ?? 'Google sign-in failed.');
     } on FirebaseAuthException catch (e) {
       dismissLoading();
+      if (e.code == 'popup-closed-by-user' ||
+          e.code == 'cancelled-popup-request') {
+        return;
+      }
       _showErrorMessage(e.message ?? 'Google sign-in failed.');
     } catch (_) {
       dismissLoading();
@@ -186,6 +199,16 @@ class _LoginPageState extends State<LoginPage> {
     loadingVisible = true;
 
     try {
+      if (kIsWeb) {
+        // pe web mergem direct prin popup-ul Firebase
+        final userCredential = await FirebaseAuth.instance.signInWithPopup(
+          FacebookAuthProvider(),
+        );
+        await _syncUserProfile(userCredential.user);
+        dismissLoading();
+        return;
+      }
+
       final LoginResult result = await FacebookAuth.instance.login();
       if (result.status != LoginStatus.success || result.accessToken == null) {
         dismissLoading();
@@ -204,6 +227,10 @@ class _LoginPageState extends State<LoginPage> {
       dismissLoading();
     } on FirebaseAuthException catch (e) {
       dismissLoading();
+      if (e.code == 'popup-closed-by-user' ||
+          e.code == 'cancelled-popup-request') {
+        return;
+      }
       _showErrorMessage(e.message ?? 'Facebook sign-in failed.');
     } catch (_) {
       dismissLoading();

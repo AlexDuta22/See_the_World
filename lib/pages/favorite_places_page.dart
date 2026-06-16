@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -8,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../services/photo_local.dart';
 import '../widgets/app_bottom_nav.dart';
 import 'ai_assistant_page.dart';
 import 'home_page.dart';
@@ -242,16 +242,16 @@ Widget _buildThumbnail({required String imageUrl, String localPath = ''}) {
     child: const Icon(Icons.photo, color: Colors.black45),
   );
   if (localPath.isNotEmpty) {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(10),
-      child: Image.file(
-        File(localPath),
-        width: 52,
-        height: 52,
-        fit: BoxFit.cover,
-        errorBuilder: (_, __, ___) => placeholder,
-      ),
+    final local = PhotoLocal.localImage(
+      localPath,
+      width: 52,
+      height: 52,
+      fit: BoxFit.cover,
+      errorPlaceholder: () => placeholder,
     );
+    if (local != null) {
+      return ClipRRect(borderRadius: BorderRadius.circular(10), child: local);
+    }
   }
   if (imageUrl.isEmpty) return placeholder;
   return ClipRRect(
@@ -273,14 +273,7 @@ Future<String?> _loadMemoryPhotoPath(String placeId) async {
 }
 
 Future<void> _removeMemoryPhoto(String placeId, String path) async {
-  try {
-    final file = File(path);
-    if (await file.exists()) {
-      await file.delete();
-    }
-  } catch (_) {
-    // Ignore file deletion errors.
-  }
+  await PhotoLocal.delete(path);
   final prefs = await SharedPreferences.getInstance();
   await prefs.remove('memory_photo_$placeId');
   await prefs.remove('memory_photo_url_$placeId');
@@ -443,9 +436,10 @@ void _showFullImage(BuildContext context, String memoryPath, String imageUrl) {
     context: context,
     barrierColor: Colors.black87,
     builder: (context) {
-      final image = memoryPath.isNotEmpty
-          ? Image.file(File(memoryPath), fit: BoxFit.contain)
-          : Image.network(imageUrl, fit: BoxFit.contain);
+      final localImage = memoryPath.isEmpty
+          ? null
+          : PhotoLocal.localImage(memoryPath, fit: BoxFit.contain);
+      final image = localImage ?? Image.network(imageUrl, fit: BoxFit.contain);
       return Dialog.fullscreen(
         backgroundColor: Colors.black,
         child: Stack(

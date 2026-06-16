@@ -1,10 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_compass/flutter_compass.dart';
@@ -13,10 +13,8 @@ import 'package:google_places_flutter/google_places_flutter.dart';
 import 'package:google_places_flutter/model/prediction.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:flutter_polyline_points/flutter_polyline_points.dart';
-import 'package:gal/gal.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'ai_assistant_page.dart';
@@ -26,6 +24,7 @@ import 'profile_page.dart';
 import '../widgets/app_bottom_nav.dart';
 import '../services/discover_themes.dart';
 import '../services/discover_service.dart';
+import '../services/photo_local.dart';
 import '../services/taste_profile.dart';
 
 class HomePage extends StatefulWidget {
@@ -457,6 +456,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _startCompass() {
+    if (kIsWeb) return; // busola nu există pe web
     _compassSub = FlutterCompass.events?.listen((event) {
       final heading = event.heading;
       if (heading == null) return;
@@ -952,11 +952,10 @@ class _HomePageState extends State<HomePage> {
         maxHeight: 1600,
       );
       if (picked == null) return; // user canceled
-      final saved = await _persistPickedPhoto(
-        picked: picked,
-        filenamePrefix: 'capture',
-      );
-      await _saveToGallery(saved.path);
+      final localPath = await PhotoLocal.persist(picked, 'capture');
+      if (localPath != null) {
+        await PhotoLocal.saveToGallery(localPath, _galleryAlbum);
+      }
 
       // pin la locatia curenta
       Position? pos = _lastPosition;
@@ -982,14 +981,14 @@ class _HomePageState extends State<HomePage> {
             .child(user.uid)
             .child('memories')
             .child('$id.jpg');
-        await ref.putFile(File(saved.path));
+        await ref.putData(await picked.readAsBytes());
         imageUrl = await ref.getDownloadURL();
       } catch (_) {}
 
       final memory = _PhotoMemory(
         id: id,
         imageUrl: imageUrl,
-        localPath: saved.path,
+        localPath: localPath,
         position: LatLng(pos.latitude, pos.longitude),
         takenAt: DateTime.now(),
       );
@@ -1005,7 +1004,7 @@ class _HomePageState extends State<HomePage> {
               'lng': memory.position.longitude,
               'takenAt': Timestamp.fromDate(memory.takenAt),
               'imageUrl': imageUrl,
-              'localPath': saved.path,
+              'localPath': localPath ?? '',
             });
       } catch (_) {
         if (mounted) _showSnack('Nu am putut salva amintirea în cloud.');
@@ -1041,9 +1040,12 @@ class _HomePageState extends State<HomePage> {
     final localPath = memory.localPath;
     // ca pozele portret sa nu iasa din dialog
     final maxImageHeight = MediaQuery.of(context).size.height * 0.6;
+    final localWidget = localPath == null
+        ? null
+        : PhotoLocal.localImage(localPath, fit: BoxFit.contain);
     final Widget image;
-    if (localPath != null && File(localPath).existsSync()) {
-      image = Image.file(File(localPath), fit: BoxFit.contain);
+    if (localWidget != null) {
+      image = localWidget;
     } else if (memory.imageUrl.isNotEmpty) {
       image = Image.network(memory.imageUrl, fit: BoxFit.contain);
     } else {
@@ -1171,9 +1173,7 @@ class _HomePageState extends State<HomePage> {
     }
     final localPath = memory.localPath;
     if (localPath != null) {
-      try {
-        File(localPath).deleteSync();
-      } catch (_) {}
+      await PhotoLocal.delete(localPath);
     }
     if (mounted) _showSnack('Amintire ștearsă.');
   }
@@ -1522,13 +1522,34 @@ class _HomePageState extends State<HomePage> {
         maxHeight: 1280,
       );
       if (picked == null) return null;
-      final saved = await _persistPickedPhoto(
-        picked: picked,
-        filenamePrefix: 'memory_$placeId',
-      );
-      await _saveToGallery(saved.path);
+      final localPath = await PhotoLocal.persist(picked, 'memory_$placeId');
+      if (localPath != null) {
+        await PhotoLocal.saveToGallery(localPath, _galleryAlbum);
+      }
+
+      // urc poza în cloud ca s-o avem și pe web / pe alte device-uri
+      String imageUrl = '';
+      final user = FirebaseAuth.instance.currentUser;
+      if (user != null) {
+        try {
+          final ref = FirebaseStorage.instance
+              .ref()
+              .child('users')
+              .child(user.uid)
+              .child('memories')
+              .child('place_$placeId.jpg');
+          await ref.putData(await picked.readAsBytes());
+          imageUrl = await ref.getDownloadURL();
+        } catch (_) {}
+      }
+
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('memory_photo_$placeId', saved.path);
+      if (localPath != null) {
+        await prefs.setString('memory_photo_$placeId', localPath);
+      }
+      if (imageUrl.isNotEmpty) {
+        await prefs.setString('memory_photo_url_$placeId', imageUrl);
+      }
       await _recordVisitedPlace(
         placeId: placeId,
         name: name,
@@ -1538,7 +1559,7 @@ class _HomePageState extends State<HomePage> {
         types: types,
       );
       _showSnack('Memory photo saved.');
-      return saved.path;
+      return localPath ?? imageUrl;
     } catch (_) {
       _showSnack('Could not save memory photo.');
       return null;
@@ -1572,31 +1593,8 @@ class _HomePageState extends State<HomePage> {
     } catch (_) {}
   }
 
-  Future<File> _persistPickedPhoto({
-    required XFile picked,
-    required String filenamePrefix,
-  }) async {
-    final dir = await getApplicationDocumentsDirectory();
-    final target = File(
-      '${dir.path}/${filenamePrefix}_${DateTime.now().millisecondsSinceEpoch}.jpg',
-    );
-    return File(picked.path).copy(target.path);
-  }
-
   // Albumul din galeria telefonului unde punem pozele făcute în aplicație.
   static const String _galleryAlbum = 'See the World';
-
-  // Copiem poza și în galerie, într-un album dedicat. Best-effort: dacă pică
-  // (permisiune refuzată etc.), salvarea locală + cloud rămân intacte.
-  Future<void> _saveToGallery(String path) async {
-    try {
-      if (!await Gal.hasAccess(toAlbum: true)) {
-        final granted = await Gal.requestAccess(toAlbum: true);
-        if (!granted) return;
-      }
-      await Gal.putImage(path, album: _galleryAlbum);
-    } catch (_) {}
-  }
 
   Widget _buildLocalSearchField() {
     final isDark = Theme.of(context).brightness == Brightness.dark;

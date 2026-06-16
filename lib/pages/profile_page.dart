@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -400,7 +399,7 @@ class _ProfilePageState extends State<ProfilePage> {
           .child('users')
           .child(user.uid)
           .child('profile.jpg');
-      await ref.putFile(File(picked.path));
+      await ref.putData(await picked.readAsBytes());
       final url = await ref.getDownloadURL();
       await user.updatePhotoURL(url);
       await user.reload();
