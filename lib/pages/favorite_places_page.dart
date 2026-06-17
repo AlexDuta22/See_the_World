@@ -268,15 +268,19 @@ Widget _buildThumbnail({required String imageUrl, String localPath = ''}) {
 }
 
 Future<String?> _loadMemoryPhotoPath(String placeId) async {
+  final user = FirebaseAuth.instance.currentUser;
+  if (user == null) return null;
   final prefs = await SharedPreferences.getInstance();
-  return prefs.getString('memory_photo_$placeId');
+  return prefs.getString('memory_photo_${user.uid}_$placeId');
 }
 
 Future<void> _removeMemoryPhoto(String placeId, String path) async {
   await PhotoLocal.delete(path);
+  final user = FirebaseAuth.instance.currentUser;
+  if (user == null) return;
   final prefs = await SharedPreferences.getInstance();
-  await prefs.remove('memory_photo_$placeId');
-  await prefs.remove('memory_photo_url_$placeId');
+  await prefs.remove('memory_photo_${user.uid}_$placeId');
+  await prefs.remove('memory_photo_url_${user.uid}_$placeId');
 }
 
 void _showFavoriteDetails({

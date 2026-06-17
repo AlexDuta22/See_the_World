@@ -13,6 +13,8 @@ import 'package:speech_to_text/speech_to_text.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 
 import '../services/discover_themes.dart';
+import '../experiment/profile_scoring.dart';
+import '../experiment/ai_logger.dart';
 
 final ValueNotifier<List<AiMapPlace>> aiMapPlacesRequest =
     ValueNotifier<List<AiMapPlace>>(const []);
@@ -36,9 +38,8 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   bool _speechAvailable = false;
   bool _ttsEnabled = false;
   bool _english = false;
-  // Brațul experimentului: none = fără context, locationOnly = doar locație,
-  // full = locație + profil de gusturi. Trei brațe ca să putem izola aportul
-  // gusturilor (full − locationOnly) separat de cel al locației.
+  // Brațul experimentului: 2 brațe. Ambele primesc locația (baseline comun);
+  // none = fără context personal, full = cu profilul de gusturi + locuri recente.
   _ContextMode _contextMode = _ContextMode.full;
   String _partialText = '';
 
@@ -118,12 +119,16 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
 
   String get _systemPrompt => _english ? _systemPromptEn : _systemPromptRo;
 
+  // Experiment: cerem EXACT acelasi numar de recomandari in ambele brate, ca
+  // diferenta dintre A si B sa fie CARE locuri apar, nu CATE. Textul e identic
+  // indiferent de brat, deci nu afecteaza invariantul.
+  static const String _exactCountInstruction =
+      ' Oferă exact 5 recomandări de locuri, nici mai multe, nici mai puține.';
+
   IconData get _contextModeIcon {
     switch (_contextMode) {
       case _ContextMode.none:
         return Icons.person_off;
-      case _ContextMode.locationOnly:
-        return Icons.location_on;
       case _ContextMode.full:
         return Icons.person_pin_circle;
     }
@@ -132,13 +137,9 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   String get _contextModeLabel {
     switch (_contextMode) {
       case _ContextMode.none:
-        return _english ? 'Context: none' : 'Context: fără';
-      case _ContextMode.locationOnly:
-        return _english ? 'Context: location only' : 'Context: doar locație';
+        return _english ? 'Without context' : 'Fără context';
       case _ContextMode.full:
-        return _english
-            ? 'Context: location + taste'
-            : 'Context: locație + gusturi';
+        return _english ? 'With context' : 'Cu context';
     }
   }
 
@@ -283,6 +284,9 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     // Logăm fiecare apel (fără await, ca să nu blocăm UI-ul). Îl punem înaintea
     // verificării 'mounted' ca să existe un document chiar dacă userul iese.
     unawaited(_logInteraction(prompt: trimmed, result: result));
+    // Log uniform al experimentului (acelasi format ca pe Home), in plus fata de
+    // logul bogat de mai sus.
+    unawaited(_logExperimentRun(prompt: trimmed, result: result));
     if (!mounted) return;
     if (result.text != null) {
       final aiMessage = _ChatMessage(text: result.text!, isUser: false);
@@ -432,10 +436,10 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     );
   }
 
-  // Textul de personalizare injectat în prompt, în funcție de brațul ales:
-  // none → nimic, locationOnly → doar locația, full → locație + gusturi + recente.
+  // Textul injectat în prompt, în funcție de brațul ales. Ambele brațe primesc
+  // locația (baseline comun); diferă doar preferințele personale:
+  // none → doar locația, full → locație + gusturi + locuri recente.
   String _contextText(_UserSignals s) {
-    if (_contextMode == _ContextMode.none) return '';
     final full = _contextMode == _ContextMode.full;
     final hasTaste = full && s.topCategories.isNotEmpty;
     final hasRecent = full && s.recentNames.isNotEmpty;
@@ -653,7 +657,8 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         contents.removeAt(0);
       }
 
-      final systemInstruction = _systemPrompt + contextUsed;
+      final systemInstruction =
+          _systemPrompt + contextUsed + _exactCountInstruction;
 
       // Apelul nu mai conține cheia API. Cloud Function-ul autentificat
       // (askGemini) o ține pe server și vorbește el cu Gemini.
@@ -840,6 +845,52 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     } catch (_) {
       // Logare best-effort: dacă pică, nu deranjăm utilizatorul.
     }
+  }
+
+  // Logul uniform al experimentului in colectia top-level ai_logs. arm: full =
+  // cu gusturi injectate (brat B), altfel none (brat A). pairId = acelasi hash
+  // ca _logInteraction, ca sa imperechez aceeasi intrebare intre brate.
+  Future<void> _logExperimentRun({
+    required String prompt,
+    required _GeminiResult result,
+  }) async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+    final arm = _contextMode == _ContextMode.full
+        ? ContextMode.full
+        : ContextMode.none;
+
+    // Profil pe teme 0..1 din semnalele clipei, ca scorul sa fie comparabil cu
+    // cel de pe Home.
+    final counts = <DiscoverTheme, int>{};
+    for (final c in result.signals.topCategories) {
+      final theme = themeForTypes([c.type]);
+      if (theme == null) continue;
+      counts[theme] = (counts[theme] ?? 0) + c.count;
+    }
+    final profile = normalizedThemeProfile(counts);
+
+    final items = [
+      for (final p in result.recommendedPlaces)
+        {
+          'id': '',
+          'name': p.name,
+          'area': p.area,
+          'score': double.parse(
+            profileMatchScore([p.category], profile).toStringAsFixed(4),
+          ),
+        },
+    ];
+
+    await logRun(
+      arm: arm.arm,
+      surface: 'assistant',
+      uid: uid,
+      query: prompt,
+      items: items,
+      pairId: _pairId(prompt),
+      latencyMs: result.latencyMs,
+    );
   }
 
   void _scrollToBottom() {
@@ -1213,9 +1264,9 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   }
 }
 
-// Brațele experimentului de personalizare. Ordinea contează: butonul ciclează
-// prin ele, iar full − locationOnly izolează aportul profilului de gusturi.
-enum _ContextMode { none, locationOnly, full }
+// Cele 2 brațe ale experimentului. Butonul comută între ele. Ambele au locația;
+// none = fără context personal, full = cu profil de gusturi + locuri recente.
+enum _ContextMode { none, full }
 
 // Semnalele utilizatorului, colectate independent de braț ca să le putem loga
 // la fiecare apel (inclusiv pe brațul fără context).

@@ -26,6 +26,8 @@ import '../services/discover_themes.dart';
 import '../services/discover_service.dart';
 import '../services/photo_local.dart';
 import '../services/taste_profile.dart';
+import '../experiment/profile_scoring.dart';
+import '../experiment/ai_logger.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key, this.showTour = false});
@@ -79,6 +81,13 @@ class _HomePageState extends State<HomePage> {
   String _discoverLabel = '';
   double _discoverRadiusKm = 0;
   static const List<double> _discoverRadiusSteps = [3000, 8000, 15000, 25000];
+
+  // Experiment 2 brate pe harta. Acelasi pool de candidati pentru ambele brate;
+  // bratul decide DOAR ordinea, niciodata cati itemi apar. N e fix.
+  static const int _experimentN = 10;
+  ContextMode _experimentArm = ContextMode.none;
+  bool _experimentActive = false;
+  bool _experimentBusy = false;
 
   static const CameraPosition _initialCameraPosition = CameraPosition(
     target: LatLng(45.7489, 21.2087), // Timisoara
@@ -346,6 +355,13 @@ class _HomePageState extends State<HomePage> {
                 ),
               ),
             ),
+          if (_navSteps.isEmpty && !_showTourMarkers)
+            Positioned(
+              left: 12,
+              right: 12,
+              bottom: 16,
+              child: SafeArea(child: _buildExperimentBar(isDark)),
+            ),
           if (_isRouting)
             const Positioned(
               top: 0,
@@ -473,6 +489,9 @@ class _HomePageState extends State<HomePage> {
 
   void _applyDirectionalFilter() {
     if (!_proximityActive) return;
+    // In modul experiment aratam fix cele N markere ale bratului, nedependent de
+    // directia busolei — altfel N-ul nu ar mai fi garantat.
+    if (_experimentActive) return;
     final position = _lastPosition;
     if (position == null || _nearbyPlaces.isEmpty) {
       if (!mounted) return;
@@ -781,8 +800,10 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     final prefs = await SharedPreferences.getInstance();
-    final memoryPath = prefs.getString('memory_photo_$placeId') ?? '';
-    final memoryUrl = prefs.getString('memory_photo_url_$placeId') ?? '';
+    final memoryPath =
+        prefs.getString('memory_photo_${user.uid}_$placeId') ?? '';
+    final memoryUrl =
+        prefs.getString('memory_photo_url_${user.uid}_$placeId') ?? '';
     await docRef.set({
       'name': name,
       'subtitle': subtitle,
@@ -1362,6 +1383,8 @@ class _HomePageState extends State<HomePage> {
 
       if (!mounted) return;
       setState(() {
+        // iesim din modul experiment: revine filtrul pe directie + temele
+        _experimentActive = false;
         _nearbyPlaces
           ..clear()
           ..addAll(nearbyPlaces);
@@ -1374,6 +1397,184 @@ class _HomePageState extends State<HomePage> {
       });
       _applyDirectionalFilter();
     } catch (_) {}
+  }
+
+  // ---- Experiment 2 brate pe harta ----------------------------------------
+
+  // Pool partajat: aceleasi locuri din jur pentru ambele brate. Largeste raza
+  // pana strange cel putin N candidati. Returneaza (pozitie, pool) sau null.
+  Future<(Position, List<DiscoverCandidate>)?> _fetchExperimentPool() async {
+    if (!_hasLocationPermission || _placesApiKey.isEmpty) {
+      _showSnack('Activează locația pentru experiment.');
+      return null;
+    }
+    final position = await Geolocator.getCurrentPosition(
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+    );
+    _lastPosition = position;
+    await _ensureTasteProfile();
+
+    final service = DiscoverService(placesApiKey: _placesApiKey);
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    final excluded =
+        uid == null ? <String>{} : await service.visitedPlaceIds(uid);
+
+    var pool = <DiscoverCandidate>[];
+    for (final radius in _discoverRadiusSteps) {
+      pool = await service.fetchPopular(
+        lat: position.latitude,
+        lng: position.longitude,
+        radius: radius,
+        excludeIds: excluded,
+        limit: 40,
+      );
+      if (pool.length >= _experimentN) break;
+    }
+    return (position, pool);
+  }
+
+  // Afiseaza pe harta cele N locuri ale unui brat (fix N, fara filtru busola).
+  void _showExperimentArm({
+    required ContextMode arm,
+    required List<ScoredCandidate> selected,
+  }) {
+    final places = <String, _NearbyPlace>{
+      for (final s in selected)
+        s.candidate.placeId: _NearbyPlace(
+          id: s.candidate.placeId,
+          name: s.candidate.name,
+          position: LatLng(s.candidate.lat, s.candidate.lng),
+          types: s.candidate.types,
+          theme: s.candidate.theme,
+          rating: s.candidate.rating,
+        ),
+    };
+    setState(() {
+      _experimentActive = true;
+      _proximityActive = true;
+      _experimentArm = arm;
+      _nearbyPlaces
+        ..clear()
+        ..addAll(places);
+      _nearbyMarkers = _buildNearbyMarkers(places.values);
+      _discoverLabel = 'Experiment: ${arm.uiLabel} · N=${selected.length}';
+    });
+  }
+
+  List<Map<String, dynamic>> _experimentLogItems(
+    List<ScoredCandidate> selected,
+  ) => [
+    for (final s in selected)
+      {
+        'id': s.candidate.placeId,
+        'name': s.candidate.name,
+        'score': double.parse(s.score.toStringAsFixed(4)),
+      },
+  ];
+
+  // O singura rulare a bratului selectat (toggle). pairId stabil din persoana +
+  // locatie, ca acelasi loc + acelasi user sa imperecheze A cu B.
+  Future<void> _runExperimentArm(ContextMode arm) async {
+    if (_experimentBusy) return;
+    setState(() => _experimentBusy = true);
+    final stopwatch = Stopwatch()..start();
+    try {
+      final fetched = await _fetchExperimentPool();
+      if (fetched == null || !mounted) return;
+      final (position, pool) = fetched;
+      final profile = normalizedThemeProfile(_tasteProfile.counts);
+      final selected = selectArm(
+        mode: arm,
+        pool: pool,
+        profileThemes: profile,
+        originLat: position.latitude,
+        originLng: position.longitude,
+        n: _experimentN,
+      );
+      stopwatch.stop();
+      _showExperimentArm(arm: arm, selected: selected);
+
+      final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
+      final coords =
+          '${position.latitude.toStringAsFixed(4)},'
+          '${position.longitude.toStringAsFixed(4)}';
+      await logRun(
+        arm: arm.arm,
+        surface: 'home',
+        uid: uid,
+        query: 'nearby@$coords',
+        items: _experimentLogItems(selected),
+        pairId: experimentPairId(
+          '$uid|${position.latitude.toStringAsFixed(3)},'
+          '${position.longitude.toStringAsFixed(3)}',
+        ),
+        latencyMs: stopwatch.elapsedMilliseconds,
+      );
+    } catch (_) {
+      _showSnack('Experimentul a eșuat. Încearcă din nou.');
+    } finally {
+      if (mounted) setState(() => _experimentBusy = false);
+    }
+  }
+
+  // Debug: ruleaza A si B pe ACELASI pool, cu acelasi pairId -> perechea
+  // before/after pentru lucrare. Afiseaza pe harta bratul curent selectat.
+  Future<void> _runBothArms() async {
+    if (_experimentBusy) return;
+    setState(() => _experimentBusy = true);
+    try {
+      final fetched = await _fetchExperimentPool();
+      if (fetched == null || !mounted) return;
+      final (position, pool) = fetched;
+      final profile = normalizedThemeProfile(_tasteProfile.counts);
+      final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
+      final coords =
+          '${position.latitude.toStringAsFixed(4)},'
+          '${position.longitude.toStringAsFixed(4)}';
+      // Acelasi pairId pentru ambele brate la aceasta rulare pereche.
+      final pairId = experimentPairId(
+        '$uid|${position.latitude.toStringAsFixed(3)},'
+        '${position.longitude.toStringAsFixed(3)}|'
+        '${DateTime.now().millisecondsSinceEpoch}',
+      );
+
+      final selections = <ContextMode, List<ScoredCandidate>>{};
+      for (final arm in ContextMode.values) {
+        final stopwatch = Stopwatch()..start();
+        final selected = selectArm(
+          mode: arm,
+          pool: pool,
+          profileThemes: profile,
+          originLat: position.latitude,
+          originLng: position.longitude,
+          n: _experimentN,
+        );
+        stopwatch.stop();
+        selections[arm] = selected;
+        await logRun(
+          arm: arm.arm,
+          surface: 'home',
+          uid: uid,
+          query: 'nearby@$coords',
+          items: _experimentLogItems(selected),
+          pairId: pairId,
+          latencyMs: stopwatch.elapsedMilliseconds,
+        );
+      }
+      if (!mounted) return;
+      _showExperimentArm(
+        arm: _experimentArm,
+        selected: selections[_experimentArm]!,
+      );
+      _showSnack(
+        'Logged A=${selections[ContextMode.none]!.length}, '
+        'B=${selections[ContextMode.full]!.length} · pairId=$pairId',
+      );
+    } catch (_) {
+      _showSnack('Experimentul a eșuat. Încearcă din nou.');
+    } finally {
+      if (mounted) setState(() => _experimentBusy = false);
+    }
   }
 
   Future<void> _stopNavigation({required bool freeRoute}) async {
@@ -1544,11 +1745,18 @@ class _HomePageState extends State<HomePage> {
       }
 
       final prefs = await SharedPreferences.getInstance();
-      if (localPath != null) {
-        await prefs.setString('memory_photo_$placeId', localPath);
-      }
-      if (imageUrl.isNotEmpty) {
-        await prefs.setString('memory_photo_url_$placeId', imageUrl);
+      // Cheile sunt per-utilizator ca să nu se amestece amintirile între conturi
+      // pe același dispozitiv.
+      if (user != null) {
+        if (localPath != null) {
+          await prefs.setString('memory_photo_${user.uid}_$placeId', localPath);
+        }
+        if (imageUrl.isNotEmpty) {
+          await prefs.setString(
+            'memory_photo_url_${user.uid}_$placeId',
+            imageUrl,
+          );
+        }
       }
       await _recordVisitedPlace(
         placeId: placeId,
@@ -2009,6 +2217,61 @@ class _HomePageState extends State<HomePage> {
             ),
           );
         }).toList(),
+      ),
+    );
+  }
+
+  // Bara experimentului: toggle braț (Generic = A / Personalizat = B), N-ul
+  // afisat ca dovada ca ambele brate intorc acelasi numar, si butonul de debug
+  // care ruleaza ambele brate pe acelasi pool.
+  Widget _buildExperimentBar(bool isDark) {
+    return Material(
+      elevation: 4,
+      borderRadius: BorderRadius.circular(12),
+      color: isDark ? Colors.black : Colors.white,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        child: Row(
+          children: [
+            Expanded(
+              child: SegmentedButton<ContextMode>(
+                segments: const [
+                  ButtonSegment(
+                    value: ContextMode.none,
+                    label: Text('Generic'),
+                    icon: Icon(Icons.public, size: 16),
+                  ),
+                  ButtonSegment(
+                    value: ContextMode.full,
+                    label: Text('Personalizat'),
+                    icon: Icon(Icons.person_pin_circle, size: 16),
+                  ),
+                ],
+                selected: {_experimentArm},
+                showSelectedIcon: false,
+                onSelectionChanged: _experimentBusy
+                    ? null
+                    : (selection) => _runExperimentArm(selection.first),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Chip(
+              visualDensity: VisualDensity.compact,
+              label: Text('N=$_experimentN'),
+            ),
+            IconButton(
+              tooltip: 'Rulează ambele brațe',
+              onPressed: _experimentBusy ? null : _runBothArms,
+              icon: _experimentBusy
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.compare_arrows),
+            ),
+          ],
+        ),
       ),
     );
   }

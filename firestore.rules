@@ -23,6 +23,15 @@ service cloud.firestore {
       }
     }
 
+    // Loguri experiment (2 brate, Home + Assistant). Fiecare user isi scrie si
+    // citeste doar propriile rulari. Aditiv: nu blocheaza nimic din demo.
+    match /ai_logs/{logId} {
+      allow create: if request.auth != null
+                    && request.resource.data.uid == request.auth.uid;
+      allow read: if request.auth != null
+                  && resource.data.uid == request.auth.uid;
+    }
+
     // Orice cale neacoperita explicit este interzisa implicit.
   }
 }

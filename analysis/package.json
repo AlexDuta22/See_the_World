@@ -1,0 +1,13 @@
+{
+  "name": "ai-logs-analysis",
+  "description": "Export + analiză ai_logs (experiment 2 brațe) pentru lucrarea de licență",
+  "version": "1.0.0",
+  "main": "analyze_ai_logs.js",
+  "scripts": {
+    "analyze": "node analyze_ai_logs.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.0.0"
+  },
+  "private": true
+}
