@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -13,8 +12,6 @@ import 'package:speech_to_text/speech_to_text.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 
 import '../services/discover_themes.dart';
-import '../experiment/profile_scoring.dart';
-import '../experiment/ai_logger.dart';
 
 final ValueNotifier<List<AiMapPlace>> aiMapPlacesRequest =
     ValueNotifier<List<AiMapPlace>>(const []);
@@ -38,9 +35,6 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   bool _speechAvailable = false;
   bool _ttsEnabled = false;
   bool _english = false;
-  // Brațul experimentului: 2 brațe. Ambele primesc locația (baseline comun);
-  // none = fără context personal, full = cu profilul de gusturi + locuri recente.
-  _ContextMode _contextMode = _ContextMode.full;
   String _partialText = '';
 
   // Locația curentă (reverse-geocodată) injectată în contextul AI, ca Gemini să
@@ -60,11 +54,6 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   // conversația, care crește nelimitat. ~12 mesaje = ~6 schimburi, suficient
   // pentru continuitate fără să cărăm tot firul.
   static const int _maxHistoryMessages = 12;
-
-  // Modelul folosit de Cloud Function (askGemini). Îl logăm în ai_logs ca să
-  // știm pe ce model s-a măsurat experimentul; trebuie să rămână sincron cu
-  // MODEL din functions/index.js.
-  static const String _geminiModel = 'gemini-2.5-flash';
 
   // Tipuri Google Places prea generice ca să spună ceva despre gust — apar la
   // aproape orice loc, așa că le excludem din profilul de gusturi ca top-ul să
@@ -93,6 +82,12 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       ? _googlePlacesApiKey
       : _googleMapsApiKey;
 
+  // Recuperăm tipurile lipsă din Place Details (cache pe sesiune + plafon de
+  // apeluri), ca un favorit salvat fără `types` să conteze totuși în profil.
+  final Map<String, List<String>> _typeCache = {};
+  int _typeLookupCalls = 0;
+  static const int _maxTypeLookups = 25;
+
   static const String _systemPromptRo =
       'Ești un asistent de călătorie care poate oferi recomandări pentru orice oraș sau țară din lume. '
       'Dacă îți este indicată locația curentă a utilizatorului, ține cont de ea și prioritizează recomandări relevante pentru zona respectivă, fără a te limita la o singură țară. '
@@ -119,29 +114,36 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
 
   String get _systemPrompt => _english ? _systemPromptEn : _systemPromptRo;
 
-  // Experiment: cerem EXACT acelasi numar de recomandari in ambele brate, ca
-  // diferenta dintre A si B sa fie CARE locuri apar, nu CATE. Textul e identic
-  // indiferent de brat, deci nu afecteaza invariantul.
-  static const String _exactCountInstruction =
+  // Directiva culinara: cand userul cere unde sa manance, vrea restaurante (locale,
+  // fast-food populare, pizza, gratar), nu cafenele. Fara ea, modelul tinde sa
+  // amestece multe cafenele/coffee shop-uri.
+  static const String _foodFocusRo =
+      ' Când utilizatorul întreabă unde să mănânce sau cere recomandări culinare, '
+      'prioritizează restaurante — inclusiv localuri tradiționale/locale, fast-food '
+      'populare, pizzerii, grătare și restaurante apreciate —, NU cafenele sau '
+      'coffee shop-uri. Poți menționa cel mult o cafenea, și doar dacă se potrivește '
+      'cu ce a cerut utilizatorul.';
+  static const String _foodFocusEn =
+      ' When the user asks where to eat or for culinary recommendations, prioritize '
+      'restaurants — including local/traditional spots, popular fast-food, pizza, '
+      'grill and well-rated restaurants —, NOT cafes or coffee shops. Mention at '
+      'most one cafe, and only if it fits what the user asked for.';
+  String get _foodFocus => _english ? _foodFocusEn : _foodFocusRo;
+
+  // Cerem un numar fix de recomandari, ca raspunsul sa fie mereu compact si
+  // consistent (5 locuri).
+  static const String _exactCountInstructionRo =
       ' Oferă exact 5 recomandări de locuri, nici mai multe, nici mai puține.';
+  static const String _exactCountInstructionEn =
+      ' Provide exactly 5 place recommendations, no more and no fewer.';
+  String get _exactCountInstruction =>
+      _english ? _exactCountInstructionEn : _exactCountInstructionRo;
 
-  IconData get _contextModeIcon {
-    switch (_contextMode) {
-      case _ContextMode.none:
-        return Icons.person_off;
-      case _ContextMode.full:
-        return Icons.person_pin_circle;
-    }
-  }
-
-  String get _contextModeLabel {
-    switch (_contextMode) {
-      case _ContextMode.none:
-        return _english ? 'Without context' : 'Fără context';
-      case _ContextMode.full:
-        return _english ? 'With context' : 'Cu context';
-    }
-  }
+  // Pusă ULTIMA în instrucțiune (recența contează): forțează limba chiar dacă
+  // istoricul conversației e în cealaltă limbă, după ce utilizatorul comută.
+  String get _languageDirective => _english
+      ? ' Reply only in English, regardless of the language of previous messages.'
+      : ' Răspunde doar în română, indiferent de limba mesajelor anterioare.';
 
   static const String _welcomeRo =
       'Salut! Sunt asistentul tău de călătorie AI. 🗺️\n\n'
@@ -281,12 +283,6 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     _scrollToBottom();
 
     final result = await _callGemini();
-    // Logăm fiecare apel (fără await, ca să nu blocăm UI-ul). Îl punem înaintea
-    // verificării 'mounted' ca să existe un document chiar dacă userul iese.
-    unawaited(_logInteraction(prompt: trimmed, result: result));
-    // Log uniform al experimentului (acelasi format ca pe Home), in plus fata de
-    // logul bogat de mai sus.
-    unawaited(_logExperimentRun(prompt: trimmed, result: result));
     if (!mounted) return;
     if (result.text != null) {
       final aiMessage = _ChatMessage(text: result.text!, isUser: false);
@@ -393,23 +389,21 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   }
 
   // Colectează semnalele utilizatorului (locație + profil de gusturi + nume
-  // recente) INDEPENDENT de brațul experimentului. Le calculăm mereu ca să le
-  // putem loga și când nu sunt injectate — fără asta nu avem cum măsura alinierea
-  // pe brațul fără context.
+  // recente) cu care personalizăm recomandările asistentului.
   Future<_UserSignals> _collectSignals() async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return _UserSignals.empty;
 
     final location = await _fetchLocationContext();
-    final favorites = await _readPlaceEntries(user.uid, 'favorites', 'updatedAt');
-    final visited = await _readPlaceEntries(user.uid, 'visited', 'visitedAt');
+    final favorites = await _readPlaceEntries(user.uid, 'favorites');
+    final visited = await _readPlaceEntries(user.uid, 'visited');
 
     // Profil de gusturi: numărăm tipurile Google Places din favorite + vizitate
-    // și păstrăm primele 5 categorii după frecvență (ignorând tipurile generice).
+    // (recuperate din Place Details când documentul n-are `types`) și păstrăm
+    // primele 5 categorii după frecvență, ignorând tipurile generice.
     final categoryCounts = <String, int>{};
     for (final entry in [...favorites, ...visited]) {
-      for (final type in entry.types) {
-        if (_genericTypes.contains(type)) continue;
+      for (final type in await _usableTypes(entry.id, entry.types)) {
         categoryCounts[type] = (categoryCounts[type] ?? 0) + 1;
       }
     }
@@ -432,17 +426,52 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       location: location,
       topCategories: topCategories,
       recentNames: recentNames,
-      signalsCount: favorites.length + visited.length,
     );
   }
 
-  // Textul injectat în prompt, în funcție de brațul ales. Ambele brațe primesc
-  // locația (baseline comun); diferă doar preferințele personale:
-  // none → doar locația, full → locație + gusturi + locuri recente.
+  // Etichete lizibile ale celor 6 teme, ca profilul injectat să fie clar pentru
+  // model — nu tipuri brute Google („church", „cafe"), ci categorii pe înțeles.
+  static const Map<DiscoverTheme, String> _themeLabelRo = {
+    DiscoverTheme.history: 'istorie și cultură (muzee, biserici, monumente)',
+    DiscoverTheme.nature: 'natură (parcuri, grădini, peisaje)',
+    DiscoverTheme.food: 'gastronomie (restaurante, localuri)',
+    DiscoverTheme.entertainment: 'divertisment (cinema, teatru, distracție)',
+    DiscoverTheme.hotels: 'cazare',
+    DiscoverTheme.hiddenGems: 'atracții turistice',
+  };
+  static const Map<DiscoverTheme, String> _themeLabelEn = {
+    DiscoverTheme.history: 'history & culture (museums, churches, monuments)',
+    DiscoverTheme.nature: 'nature (parks, gardens, scenery)',
+    DiscoverTheme.food: 'food (restaurants, eateries)',
+    DiscoverTheme.entertainment: 'entertainment (cinema, theater, fun)',
+    DiscoverTheme.hotels: 'lodging',
+    DiscoverTheme.hiddenGems: 'tourist attractions',
+  };
+
+  // Agregă tipurile brute din profil pe cele 6 teme Discover și le întoarce
+  // ordonate descrescător, cu ponderea 0..1 a fiecăreia. E semnalul „tare" din
+  // prompt: teme clare, nu tipuri răzlețe care se pierd lângă locație + întrebare.
+  List<MapEntry<DiscoverTheme, double>> _profileThemes(_UserSignals s) {
+    final counts = <DiscoverTheme, int>{};
+    var total = 0;
+    for (final c in s.topCategories) {
+      final theme = themeForTypes([c.type]);
+      if (theme == null) continue;
+      counts[theme] = (counts[theme] ?? 0) + c.count;
+      total += c.count;
+    }
+    if (total == 0) return const [];
+    final ranked = counts.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    return [for (final e in ranked) MapEntry(e.key, e.value / total)];
+  }
+
+  // Contextul de personalizare injectat în prompt: locație + profil de gusturi +
+  // locuri recente. Se construiește mereu (asistentul e personalizat by default).
   String _contextText(_UserSignals s) {
-    final full = _contextMode == _ContextMode.full;
-    final hasTaste = full && s.topCategories.isNotEmpty;
-    final hasRecent = full && s.recentNames.isNotEmpty;
+    final themes = _profileThemes(s);
+    final hasTaste = themes.isNotEmpty;
+    final hasRecent = s.recentNames.isNotEmpty;
     if (s.location.isEmpty && !hasTaste && !hasRecent) return '';
 
     final buffer = StringBuffer();
@@ -460,12 +489,21 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         );
       }
       if (hasTaste) {
-        final formatted =
+        final formatted = themes
+            .map((e) => '${_themeLabelEn[e.key]} ${(e.value * 100).round()}%')
+            .join(', ');
+        final topLabels =
+            themes.take(2).map((e) => _themeLabelEn[e.key]).join(' and ');
+        final firstLabel = _themeLabelEn[themes.first.key];
+        final rawTypes =
             s.topCategories.map((e) => '${e.type} (${e.count})').join(', ');
         buffer.write(
-          '\n- Taste profile (place categories the user saves or visits most, '
-          'with counts): $formatted. Infer the tastes these reveal and prioritize '
-          'new destinations that match them.',
+          '\n- Taste profile, inferred from the places the user saves and visits, '
+          'ranked by weight: $formatted. This is the MOST important signal — it '
+          'outweighs generic popularity. At least 3 of your 5 recommendations MUST '
+          'belong to the dominant categories ($topLabels), and the FIRST one must '
+          'be $firstLabel. Only the remaining recommendations may fall outside '
+          'these. (Underlying place types: $rawTypes.)',
         );
       }
       if (hasRecent) {
@@ -489,12 +527,21 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         );
       }
       if (hasTaste) {
-        final formatted =
+        final formatted = themes
+            .map((e) => '${_themeLabelRo[e.key]} ${(e.value * 100).round()}%')
+            .join(', ');
+        final topLabels =
+            themes.take(2).map((e) => _themeLabelRo[e.key]).join(' și ');
+        final firstLabel = _themeLabelRo[themes.first.key];
+        final rawTypes =
             s.topCategories.map((e) => '${e.type} (${e.count})').join(', ');
         buffer.write(
-          '\n- Profil de gusturi (categoriile de locuri pe care le salvează sau '
-          'vizitează cel mai des, cu numărul de apariții): $formatted. Deduce '
-          'preferințele pe care le arată și prioritizează destinații noi care se potrivesc.',
+          '\n- Profil de gust, dedus din locurile pe care utilizatorul le salvează '
+          'și vizitează, ordonat după pondere: $formatted. Acesta e cel MAI '
+          'important semnal — contează mai mult decât popularitatea generică. Cel '
+          'puțin 3 din cele 5 recomandări TREBUIE să fie din categoriile dominante '
+          '($topLabels), iar PRIMA să fie din $firstLabel. Doar restul pot ieși din '
+          'aceste categorii. (Tipuri de loc în detaliu: $rawTypes.)',
         );
       }
       if (hasRecent) {
@@ -507,19 +554,20 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     return buffer.toString();
   }
 
-  Future<List<({String name, List<String> types})>> _readPlaceEntries(
+  // Citim fără orderBy: dacă un document n-are câmpul de timp, orderBy l-ar fi
+  // scos tăcut și profilul ar ieși gol. Întoarcem și id-ul (place_id) ca să
+  // putem recupera tipurile lipsă din Place Details.
+  Future<List<({String id, String name, List<String> types})>> _readPlaceEntries(
     String uid,
     String collection,
-    String orderField,
   ) async {
-    final entries = <({String name, List<String> types})>[];
+    final entries = <({String id, String name, List<String> types})>[];
     try {
       final snapshot = await FirebaseFirestore.instance
           .collection('users')
           .doc(uid)
           .collection(collection)
-          .orderBy(orderField, descending: true)
-          .limit(15)
+          .limit(50)
           .get();
       for (final doc in snapshot.docs) {
         final data = doc.data();
@@ -528,10 +576,50 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         final types = rawTypes is List
             ? rawTypes.map((e) => e.toString()).toList()
             : <String>[];
-        entries.add((name: name, types: types));
+        entries.add((id: doc.id, name: name, types: types));
       }
     } catch (_) {}
     return entries;
+  }
+
+  // Tipurile relevante ale unui loc: din `types` stocat dacă mai rămâne ceva
+  // după scoaterea celor generice; altfel le cerem din Place Details după id.
+  Future<List<String>> _usableTypes(String id, List<String> stored) async {
+    final fromStored = stored.where((t) => !_genericTypes.contains(t)).toList();
+    if (fromStored.isNotEmpty) return fromStored;
+    final fetched = await _fetchTypesByPlaceId(id);
+    return fetched.where((t) => !_genericTypes.contains(t)).toList();
+  }
+
+  // Tipurile unui place_id din Place Details. Sărim id-urile AI (nu sunt
+  // place_id reale) și plafonăm apelurile ca să nu ardem quota.
+  Future<List<String>> _fetchTypesByPlaceId(String id) async {
+    if (_typeCache.containsKey(id)) return _typeCache[id]!;
+    if (id.startsWith('ai-') || id.length < 20) return const [];
+    await _ensurePlacesApiKey();
+    if (_placesApiKey.isEmpty || _typeLookupCalls >= _maxTypeLookups) {
+      return const [];
+    }
+    _typeLookupCalls++;
+    try {
+      final url = Uri.parse(
+        'https://maps.googleapis.com/maps/api/place/details/json'
+        '?place_id=$id&fields=types&key=$_placesApiKey',
+      );
+      final response = await http.get(url);
+      if (response.statusCode != 200) return const [];
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final result = data['result'] as Map<String, dynamic>?;
+      final types =
+          (result?['types'] as List<dynamic>?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          const <String>[];
+      _typeCache[id] = types;
+      return types;
+    } catch (_) {
+      return const [];
+    }
   }
 
   // Locația curentă pentru contextul AI. Returnează o expresie gata de inserat
@@ -624,12 +712,8 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   }
 
   Future<_GeminiResult> _callGemini() async {
-    // Construim contextul ÎNAINTE de cronometru: vrem ca latencyMs să măsoare
-    // doar apelul către funcție/Gemini, nu și citirile din Firestore/locație.
-    // Semnalele se colectează mereu (pentru logare); doar injectarea ține de braț.
     final signals = await _collectSignals();
     final contextUsed = _contextText(signals);
-    final stopwatch = Stopwatch();
     try {
       // _messages conține deja întreaga conversație, inclusiv mesajul tocmai
       // trimis de utilizator (adăugat în _sendMessage), așa că NU îl mai adăugăm
@@ -658,7 +742,7 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
       }
 
       final systemInstruction =
-          _systemPrompt + contextUsed + _exactCountInstruction;
+          _systemPrompt + _foodFocus + contextUsed + _exactCountInstruction + _languageDirective;
 
       // Apelul nu mai conține cheia API. Cloud Function-ul autentificat
       // (askGemini) o ține pe server și vorbește el cu Gemini.
@@ -667,68 +751,33 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
             'askGemini',
             options: HttpsCallableOptions(timeout: const Duration(seconds: 30)),
           );
-      stopwatch.start();
       final response = await callable.call<Map<String, dynamic>>({
         'systemInstruction': systemInstruction,
         'contents': contents,
       });
-      stopwatch.stop();
-
-      final promptTokens = _asInt(response.data['promptTokens']);
-      final responseTokens = _asInt(response.data['responseTokens']);
-      final geminiLatencyMs = _asInt(response.data['geminiLatencyMs']);
 
       final text = response.data['text']?.toString();
       if (text == null || text.isEmpty) {
-        return _GeminiResult(
+        return const _GeminiResult(
           text: null,
-          places: const [],
+          places: [],
           error: 'Răspuns gol de la asistent.',
-          contextUsed: contextUsed,
-          signals: signals,
-          latencyMs: stopwatch.elapsedMilliseconds,
-          geminiLatencyMs: geminiLatencyMs,
-          promptTokens: promptTokens,
-          responseTokens: responseTokens,
-          recommendedCategories: null,
-          recommendedPlaces: const [],
         );
       }
       final rawPlaces = response.data['places'];
       final places = <({String name, String area})>[];
-      final categories = <String>[];
-      final recommendedPlaces =
-          <({String name, String area, String category})>[];
       if (rawPlaces is List) {
         for (final item in rawPlaces) {
           if (item is Map) {
             final name = item['name']?.toString().trim() ?? '';
             if (name.isEmpty) continue;
             final area = item['area']?.toString().trim() ?? '';
-            final category = item['category']?.toString().trim() ?? '';
             places.add((name: name, area: area));
-            if (category.isNotEmpty) categories.add(category);
-            recommendedPlaces.add(
-              (name: name, area: area, category: category),
-            );
           }
         }
       }
-      return _GeminiResult(
-        text: text,
-        places: places,
-        error: null,
-        contextUsed: contextUsed,
-        signals: signals,
-        latencyMs: stopwatch.elapsedMilliseconds,
-        geminiLatencyMs: geminiLatencyMs,
-        promptTokens: promptTokens,
-        responseTokens: responseTokens,
-        recommendedCategories: categories.isEmpty ? null : categories,
-        recommendedPlaces: recommendedPlaces,
-      );
+      return _GeminiResult(text: text, places: places, error: null);
     } on FirebaseFunctionsException catch (e) {
-      if (stopwatch.isRunning) stopwatch.stop();
       // Includem și codul (not-found, unauthenticated, unavailable...) ca să fie
       // ușor de diagnosticat. 'not-found' = funcția nu e deployată / regiune greșită.
       final detail = e.message ?? 'fără detalii';
@@ -736,161 +785,10 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         text: null,
         places: const [],
         error: 'Eroare asistent [${e.code}]: $detail',
-        contextUsed: contextUsed,
-        signals: signals,
-        latencyMs: stopwatch.elapsedMilliseconds,
-        geminiLatencyMs: null,
-        promptTokens: null,
-        responseTokens: null,
-        recommendedCategories: null,
-        recommendedPlaces: const [],
       );
     } catch (e) {
-      if (stopwatch.isRunning) stopwatch.stop();
-      return _GeminiResult(
-        text: null,
-        places: const [],
-        error: 'Excepție: $e',
-        contextUsed: contextUsed,
-        signals: signals,
-        latencyMs: stopwatch.elapsedMilliseconds,
-        geminiLatencyMs: null,
-        promptTokens: null,
-        responseTokens: null,
-        recommendedCategories: null,
-        recommendedPlaces: const [],
-      );
+      return _GeminiResult(text: null, places: const [], error: 'Excepție: $e');
     }
-  }
-
-  int? _asInt(Object? value) {
-    if (value is int) return value;
-    if (value is num) return value.toInt();
-    if (value is String) return int.tryParse(value);
-    return null;
-  }
-
-  // Id stabil derivat din prompt (FNV-1a), ca să grupăm la analiză apelurile pe
-  // același prompt din brațe diferite. String.hashCode nu e garantat stabil.
-  String _pairId(String prompt) {
-    final norm = prompt.trim().toLowerCase();
-    var hash = 0x811c9dc5;
-    for (final unit in norm.codeUnits) {
-      hash ^= unit;
-      hash = (hash * 0x01000193) & 0xFFFFFFFF;
-    }
-    return hash.toRadixString(16).padLeft(8, '0');
-  }
-
-  // Logăm fiecare apel AI într-o colecție separată pentru analiza experimentului.
-  // Best-effort: rulează fără await (nu blochează UI-ul) și înghite erorile.
-  Future<void> _logInteraction({
-    required String prompt,
-    required _GeminiResult result,
-  }) async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) return;
-    try {
-      // Aducem profilul pe cele 6 teme Discover (aceeași taxonomie cu care
-      // mapăm recomandările mai jos), ca alinierea să se calculeze pe aceeași
-      // riglă pentru ambele laturi — totul local, fără apeluri Places.
-      final profileThemeCounts = <String, int>{};
-      for (final c in result.signals.topCategories) {
-        final theme = themeForTypes([c.type])?.name;
-        if (theme == null) continue;
-        profileThemeCounts[theme] = (profileThemeCounts[theme] ?? 0) + c.count;
-      }
-      await FirebaseFirestore.instance
-          .collection('users')
-          .doc(user.uid)
-          .collection('ai_logs')
-          .add({
-            'timestamp': FieldValue.serverTimestamp(),
-            // brațul experimentului. 'condition' rămâne bool (true doar la full)
-            // pentru compatibilitate; 'conditionLabel' dă brațul exact.
-            'condition': _contextMode == _ContextMode.full,
-            'conditionLabel': _contextMode.name,
-            // leagă apelurile pe același prompt între brațe (comparație împerecheată)
-            'pairId': _pairId(prompt),
-            'prompt': prompt,
-            'response': result.text ?? result.error ?? '',
-            'contextUsed': result.contextUsed,
-            // profilul din clipa apelului, logat INDIFERENT de braț — fără el nu
-            // putem calcula alinierea pe brațele fără gusturi injectate.
-            'profileCategories': result.signals.topCategories
-                .map((c) => {'type': c.type, 'count': c.count})
-                .toList(),
-            // același profil, dar agregat pe teme (history/nature/food/...)
-            'profileThemes': profileThemeCounts.entries
-                .map((e) => {'theme': e.key, 'count': e.value})
-                .toList(),
-            'signalsCount': result.signals.signalsCount,
-            'hasLocation': result.signals.location.isNotEmpty,
-            'latencyMs': result.latencyMs,
-            'geminiLatencyMs': result.geminiLatencyMs,
-            'promptTokens': result.promptTokens,
-            'responseTokens': result.responseTokens,
-            'recommendedCategories': result.recommendedCategories,
-            'recommendedPlaces': result.recommendedPlaces
-                .map((p) => {
-                      'name': p.name,
-                      'area': p.area,
-                      'category': p.category,
-                      // tema derivată din categorie, aceeași riglă ca profileThemes
-                      'theme': themeForTypes([p.category])?.name,
-                    })
-                .toList(),
-            'model': _geminiModel,
-          });
-    } catch (_) {
-      // Logare best-effort: dacă pică, nu deranjăm utilizatorul.
-    }
-  }
-
-  // Logul uniform al experimentului in colectia top-level ai_logs. arm: full =
-  // cu gusturi injectate (brat B), altfel none (brat A). pairId = acelasi hash
-  // ca _logInteraction, ca sa imperechez aceeasi intrebare intre brate.
-  Future<void> _logExperimentRun({
-    required String prompt,
-    required _GeminiResult result,
-  }) async {
-    final uid = FirebaseAuth.instance.currentUser?.uid;
-    if (uid == null) return;
-    final arm = _contextMode == _ContextMode.full
-        ? ContextMode.full
-        : ContextMode.none;
-
-    // Profil pe teme 0..1 din semnalele clipei, ca scorul sa fie comparabil cu
-    // cel de pe Home.
-    final counts = <DiscoverTheme, int>{};
-    for (final c in result.signals.topCategories) {
-      final theme = themeForTypes([c.type]);
-      if (theme == null) continue;
-      counts[theme] = (counts[theme] ?? 0) + c.count;
-    }
-    final profile = normalizedThemeProfile(counts);
-
-    final items = [
-      for (final p in result.recommendedPlaces)
-        {
-          'id': '',
-          'name': p.name,
-          'area': p.area,
-          'score': double.parse(
-            profileMatchScore([p.category], profile).toStringAsFixed(4),
-          ),
-        },
-    ];
-
-    await logRun(
-      arm: arm.arm,
-      surface: 'assistant',
-      uid: uid,
-      query: prompt,
-      items: items,
-      pairId: _pairId(prompt),
-      latencyMs: result.latencyMs,
-    );
   }
 
   void _scrollToBottom() {
@@ -1118,22 +1016,6 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
             ),
           ),
           IconButton(
-            icon: Icon(_contextModeIcon),
-            tooltip: _contextModeLabel,
-            onPressed: () {
-              setState(() {
-                _contextMode = _ContextMode.values[(_contextMode.index + 1) %
-                    _ContextMode.values.length];
-              });
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  duration: const Duration(seconds: 1),
-                  content: Text(_contextModeLabel),
-                ),
-              );
-            },
-          ),
-          IconButton(
             icon: Icon(_ttsEnabled ? Icons.volume_up : Icons.volume_off),
             tooltip: _ttsEnabled ? 'Dezactivează vocea' : 'Activează vocea',
             onPressed: () {
@@ -1264,33 +1146,24 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   }
 }
 
-// Cele 2 brațe ale experimentului. Butonul comută între ele. Ambele au locația;
-// none = fără context personal, full = cu profil de gusturi + locuri recente.
-enum _ContextMode { none, full }
-
-// Semnalele utilizatorului, colectate independent de braț ca să le putem loga
-// la fiecare apel (inclusiv pe brațul fără context).
+// Semnalele utilizatorului folosite ca să personalizăm recomandările: locație +
+// profil de gusturi + nume recente.
 class _UserSignals {
   const _UserSignals({
     required this.location,
     required this.topCategories,
     required this.recentNames,
-    required this.signalsCount,
   });
 
   final String location;
   // top-5 categorii (tip Google Places + nr. apariții) din favorite + vizitate
   final List<({String type, int count})> topCategories;
   final List<String> recentNames;
-  // câte locuri (favorite + vizitate) au stat la baza profilului — pentru
-  // analiza efectului în funcție de bogăția istoricului / cold-start
-  final int signalsCount;
 
   static const empty = _UserSignals(
     location: '',
     topCategories: [],
     recentNames: [],
-    signalsCount: 0,
   );
 }
 
@@ -1299,31 +1172,10 @@ class _GeminiResult {
     required this.text,
     required this.places,
     required this.error,
-    required this.contextUsed,
-    required this.signals,
-    required this.latencyMs,
-    required this.geminiLatencyMs,
-    required this.promptTokens,
-    required this.responseTokens,
-    required this.recommendedCategories,
-    required this.recommendedPlaces,
   });
   final String? text;
   final List<({String name, String area})> places;
   final String? error;
-  final String contextUsed;
-  // Profilul/semnalele din clipa apelului, logate indiferent de braț.
-  final _UserSignals signals;
-  final int latencyMs;
-  // Latența pură Gemini măsurată pe server (geminiLatencyMs din răspuns), separat
-  // de round-trip-ul total. Null dacă apelul a eșuat înainte de răspuns.
-  final int? geminiLatencyMs;
-  final int? promptTokens;
-  final int? responseTokens;
-  final List<String>? recommendedCategories;
-  // Locurile recomandate structurate (nume + zonă + categorie împreună), pentru
-  // alinierea/noutatea din analiză, nu doar lista plată de categorii.
-  final List<({String name, String area, String category})> recommendedPlaces;
 }
 
 class _ChatMessage {

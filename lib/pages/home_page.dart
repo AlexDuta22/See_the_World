@@ -26,8 +26,6 @@ import '../services/discover_themes.dart';
 import '../services/discover_service.dart';
 import '../services/photo_local.dart';
 import '../services/taste_profile.dart';
-import '../experiment/profile_scoring.dart';
-import '../experiment/ai_logger.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key, this.showTour = false});
@@ -80,14 +78,7 @@ class _HomePageState extends State<HomePage> {
   bool _discoverInitialized = false;
   String _discoverLabel = '';
   double _discoverRadiusKm = 0;
-  static const List<double> _discoverRadiusSteps = [3000, 8000, 15000, 25000];
-
-  // Experiment 2 brate pe harta. Acelasi pool de candidati pentru ambele brate;
-  // bratul decide DOAR ordinea, niciodata cati itemi apar. N e fix.
-  static const int _experimentN = 10;
-  ContextMode _experimentArm = ContextMode.none;
-  bool _experimentActive = false;
-  bool _experimentBusy = false;
+  static const List<double> _discoverRadiusSteps = [3000, 6000, 10000];
 
   static const CameraPosition _initialCameraPosition = CameraPosition(
     target: LatLng(45.7489, 21.2087), // Timisoara
@@ -127,6 +118,7 @@ class _HomePageState extends State<HomePage> {
     _initTopPlaces();
     _loadOfflineTour();
     _loadPhotoMemories();
+    _recoverLostMemoryPhoto();
     aiMapPlacesRequest.addListener(_handleAiPlacesRequest);
   }
 
@@ -355,13 +347,6 @@ class _HomePageState extends State<HomePage> {
                 ),
               ),
             ),
-          if (_navSteps.isEmpty && !_showTourMarkers)
-            Positioned(
-              left: 12,
-              right: 12,
-              bottom: 16,
-              child: SafeArea(child: _buildExperimentBar(isDark)),
-            ),
           if (_isRouting)
             const Positioned(
               top: 0,
@@ -489,9 +474,6 @@ class _HomePageState extends State<HomePage> {
 
   void _applyDirectionalFilter() {
     if (!_proximityActive) return;
-    // In modul experiment aratam fix cele N markere ale bratului, nedependent de
-    // directia busolei — altfel N-ul nu ar mai fi garantat.
-    if (_experimentActive) return;
     final position = _lastPosition;
     if (position == null || _nearbyPlaces.isEmpty) {
       if (!mounted) return;
@@ -582,6 +564,12 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _showNearbyPlaceDetails(_NearbyPlace place) {
+    // Re-verificam favoritul din Firestore o data per deschidere a cardului, ca
+    // inima sa nu ramana rosie dupa ce locul a fost scos din favorite din alta
+    // parte (ex. pagina Favorite). userToggled blocheaza suprascrierea daca
+    // userul apasa inima inainte sa raspunda fetch-ul.
+    var favoriteSynced = false;
+    var userToggledFavorite = false;
     showDialog<void>(
       context: context,
       builder: (context) {
@@ -602,7 +590,6 @@ class _HomePageState extends State<HomePage> {
                 (details?['opening_hours']
                     as Map<String, dynamic>?)?['open_now'];
             final photoUrl = _placePhotoUrl(details);
-            final isFavorite = _favoriteCache[place.id] ?? false;
             return Dialog(
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(16),
@@ -703,38 +690,78 @@ class _HomePageState extends State<HomePage> {
                                 });
                               },
                             ),
-                            TextButton.icon(
-                              onPressed: () async {
-                                final user = FirebaseAuth.instance.currentUser;
-                                if (user == null) {
-                                  _showSnack('Sign in to save favorites.');
-                                  return;
+                            // Inima cu feedback instant. Are propriul
+                            // StatefulBuilder ca sa se recoloreze imediat in
+                            // dialog — setState-ul paginii nu reconstruieste un
+                            // card din overlay, de aceea inainte parea ca nu
+                            // reactioneaza.
+                            StatefulBuilder(
+                              builder: (context, setHeartState) {
+                                final isFavorite =
+                                    _favoriteCache[place.id] ?? false;
+                                // La deschidere verificam mereu starea persistenta
+                                // (Firestore, per-user); cache-ul doar paint-uieste
+                                // instant, apoi corectam dupa sursa de adevar.
+                                if (!favoriteSynced) {
+                                  favoriteSynced = true;
+                                  _loadFavoriteStatus(place.id).then((value) {
+                                    if (!mounted || userToggledFavorite) return;
+                                    setHeartState(
+                                      () => _favoriteCache[place.id] = value,
+                                    );
+                                  });
                                 }
-                                final next = !isFavorite;
-                                setState(() {
-                                  _favoriteCache[place.id] = next;
-                                });
-                                await _setFavorite(
-                                  placeId: place.id,
-                                  isFavorite: next,
-                                  name: place.name,
-                                  subtitle: '',
-                                  description: address,
-                                  imageUrl: photoUrl ?? '',
-                                  lat: place.position.latitude,
-                                  lng: place.position.longitude,
-                                  types: place.types,
+                                return TextButton.icon(
+                                  onPressed: () async {
+                                    final user =
+                                        FirebaseAuth.instance.currentUser;
+                                    if (user == null) {
+                                      _showSnack('Sign in to save favorites.');
+                                      return;
+                                    }
+                                    userToggledFavorite = true;
+                                    final next = !isFavorite;
+                                    // update optimist: inima reactioneaza acum
+                                    setHeartState(
+                                      () => _favoriteCache[place.id] = next,
+                                    );
+                                    try {
+                                      await _setFavorite(
+                                        placeId: place.id,
+                                        isFavorite: next,
+                                        name: place.name,
+                                        subtitle: '',
+                                        description: address,
+                                        imageUrl: photoUrl ?? '',
+                                        lat: place.position.latitude,
+                                        lng: place.position.longitude,
+                                        types: place.types,
+                                      );
+                                    } catch (_) {
+                                      // esec -> revenim la starea anterioara
+                                      if (!mounted) return;
+                                      setHeartState(
+                                        () => _favoriteCache[place.id] =
+                                            isFavorite,
+                                      );
+                                      _showSnack(
+                                        'Could not update favorites.',
+                                      );
+                                    }
+                                  },
+                                  icon: Icon(
+                                    isFavorite
+                                        ? Icons.favorite
+                                        : Icons.favorite_border,
+                                    color: isFavorite ? Colors.red : null,
+                                  ),
+                                  label: Text(
+                                    isFavorite
+                                        ? 'Favorite'
+                                        : 'Add to favorites',
+                                  ),
                                 );
                               },
-                              icon: Icon(
-                                isFavorite
-                                    ? Icons.favorite
-                                    : Icons.favorite_border,
-                                color: isFavorite ? Colors.red : null,
-                              ),
-                              label: Text(
-                                isFavorite ? 'Favorited' : 'Add to favorites',
-                              ),
                             ),
                           ],
                         ),
@@ -804,7 +831,7 @@ class _HomePageState extends State<HomePage> {
         prefs.getString('memory_photo_${user.uid}_$placeId') ?? '';
     final memoryUrl =
         prefs.getString('memory_photo_url_${user.uid}_$placeId') ?? '';
-    await docRef.set({
+    final data = <String, dynamic>{
       'name': name,
       'subtitle': subtitle,
       'description': description,
@@ -813,9 +840,14 @@ class _HomePageState extends State<HomePage> {
       'memoryPhotoUrl': memoryUrl,
       'lat': lat,
       'lng': lng,
-      'types': types,
       'updatedAt': FieldValue.serverTimestamp(),
-    });
+    };
+    // Locurile deschise din popup-ul de detalii (AI/offline) n-au tipuri Places.
+    // Le scriem doar când le avem și dăm merge, ca un re-favorite din popup să nu
+    // șteargă tipurile salvate inițial din card — altfel profilul de gusturi (și
+    // experimentul) ar rămâne gol.
+    if (types.isNotEmpty) data['types'] = types;
+    await docRef.set(data, SetOptions(merge: true));
   }
 
   Widget _circleIconButton({
@@ -992,7 +1024,7 @@ class _HomePageState extends State<HomePage> {
         return;
       }
 
-      // urc poza in Storage, salvez amintirea in Firestore
+      // urc poza in Storage, apoi o pin pe harta + o persist in `memories`
       final id = DateTime.now().millisecondsSinceEpoch.toString();
       String imageUrl = '';
       try {
@@ -1006,40 +1038,16 @@ class _HomePageState extends State<HomePage> {
         imageUrl = await ref.getDownloadURL();
       } catch (_) {}
 
-      final memory = _PhotoMemory(
+      final position = LatLng(pos.latitude, pos.longitude);
+      await _addPhotoMemory(
         id: id,
-        imageUrl: imageUrl,
+        position: position,
         localPath: localPath,
-        position: LatLng(pos.latitude, pos.longitude),
-        takenAt: DateTime.now(),
+        imageUrl: imageUrl,
       );
-
-      try {
-        await FirebaseFirestore.instance
-            .collection('users')
-            .doc(user.uid)
-            .collection('memories')
-            .doc(id)
-            .set({
-              'lat': memory.position.latitude,
-              'lng': memory.position.longitude,
-              'takenAt': Timestamp.fromDate(memory.takenAt),
-              'imageUrl': imageUrl,
-              'localPath': localPath ?? '',
-            });
-      } catch (_) {
-        if (mounted) _showSnack('Nu am putut salva amintirea în cloud.');
-      }
-
       if (!mounted) return;
-      setState(() {
-        _photoMemories.add(memory);
-        _photoMemoryMarkers = _buildPhotoMemoryMarkers();
-      });
-      _mapController?.animateCamera(
-        CameraUpdate.newLatLngZoom(memory.position, 16),
-      );
-      if (mounted) _showSnack('Amintire adăugată pe hartă.');
+      _mapController?.animateCamera(CameraUpdate.newLatLngZoom(position, 16));
+      _showSnack('Amintire adăugată pe hartă.');
     } catch (_) {
       if (mounted) _showSnack('Could not open camera.');
     }
@@ -1309,6 +1317,7 @@ class _HomePageState extends State<HomePage> {
         });
   }
 
+  // Construiește o singură dată profilul de gust din favorite/vizitate.
   Future<void> _ensureTasteProfile() async {
     if (_profileBuilt) return;
     _profileBuilt = true;
@@ -1366,7 +1375,10 @@ class _HomePageState extends State<HomePage> {
                 excludeIds: excluded,
               );
         usedRadius = radius;
-        if (results.isNotEmpty) break;
+        // Largim raza pana strangem destule obiective reale: dupa filtrul de
+        // calitate, o raza mica poate intoarce 1-2 locuri si ar opri cautarea
+        // inainte sa ajunga la atractiile cunoscute de mai departe.
+        if (results.length >= 6) break;
       }
 
       final nearbyPlaces = <String, _NearbyPlace>{
@@ -1383,8 +1395,6 @@ class _HomePageState extends State<HomePage> {
 
       if (!mounted) return;
       setState(() {
-        // iesim din modul experiment: revine filtrul pe directie + temele
-        _experimentActive = false;
         _nearbyPlaces
           ..clear()
           ..addAll(nearbyPlaces);
@@ -1397,184 +1407,6 @@ class _HomePageState extends State<HomePage> {
       });
       _applyDirectionalFilter();
     } catch (_) {}
-  }
-
-  // ---- Experiment 2 brate pe harta ----------------------------------------
-
-  // Pool partajat: aceleasi locuri din jur pentru ambele brate. Largeste raza
-  // pana strange cel putin N candidati. Returneaza (pozitie, pool) sau null.
-  Future<(Position, List<DiscoverCandidate>)?> _fetchExperimentPool() async {
-    if (!_hasLocationPermission || _placesApiKey.isEmpty) {
-      _showSnack('Activează locația pentru experiment.');
-      return null;
-    }
-    final position = await Geolocator.getCurrentPosition(
-      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
-    );
-    _lastPosition = position;
-    await _ensureTasteProfile();
-
-    final service = DiscoverService(placesApiKey: _placesApiKey);
-    final uid = FirebaseAuth.instance.currentUser?.uid;
-    final excluded =
-        uid == null ? <String>{} : await service.visitedPlaceIds(uid);
-
-    var pool = <DiscoverCandidate>[];
-    for (final radius in _discoverRadiusSteps) {
-      pool = await service.fetchPopular(
-        lat: position.latitude,
-        lng: position.longitude,
-        radius: radius,
-        excludeIds: excluded,
-        limit: 40,
-      );
-      if (pool.length >= _experimentN) break;
-    }
-    return (position, pool);
-  }
-
-  // Afiseaza pe harta cele N locuri ale unui brat (fix N, fara filtru busola).
-  void _showExperimentArm({
-    required ContextMode arm,
-    required List<ScoredCandidate> selected,
-  }) {
-    final places = <String, _NearbyPlace>{
-      for (final s in selected)
-        s.candidate.placeId: _NearbyPlace(
-          id: s.candidate.placeId,
-          name: s.candidate.name,
-          position: LatLng(s.candidate.lat, s.candidate.lng),
-          types: s.candidate.types,
-          theme: s.candidate.theme,
-          rating: s.candidate.rating,
-        ),
-    };
-    setState(() {
-      _experimentActive = true;
-      _proximityActive = true;
-      _experimentArm = arm;
-      _nearbyPlaces
-        ..clear()
-        ..addAll(places);
-      _nearbyMarkers = _buildNearbyMarkers(places.values);
-      _discoverLabel = 'Experiment: ${arm.uiLabel} · N=${selected.length}';
-    });
-  }
-
-  List<Map<String, dynamic>> _experimentLogItems(
-    List<ScoredCandidate> selected,
-  ) => [
-    for (final s in selected)
-      {
-        'id': s.candidate.placeId,
-        'name': s.candidate.name,
-        'score': double.parse(s.score.toStringAsFixed(4)),
-      },
-  ];
-
-  // O singura rulare a bratului selectat (toggle). pairId stabil din persoana +
-  // locatie, ca acelasi loc + acelasi user sa imperecheze A cu B.
-  Future<void> _runExperimentArm(ContextMode arm) async {
-    if (_experimentBusy) return;
-    setState(() => _experimentBusy = true);
-    final stopwatch = Stopwatch()..start();
-    try {
-      final fetched = await _fetchExperimentPool();
-      if (fetched == null || !mounted) return;
-      final (position, pool) = fetched;
-      final profile = normalizedThemeProfile(_tasteProfile.counts);
-      final selected = selectArm(
-        mode: arm,
-        pool: pool,
-        profileThemes: profile,
-        originLat: position.latitude,
-        originLng: position.longitude,
-        n: _experimentN,
-      );
-      stopwatch.stop();
-      _showExperimentArm(arm: arm, selected: selected);
-
-      final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
-      final coords =
-          '${position.latitude.toStringAsFixed(4)},'
-          '${position.longitude.toStringAsFixed(4)}';
-      await logRun(
-        arm: arm.arm,
-        surface: 'home',
-        uid: uid,
-        query: 'nearby@$coords',
-        items: _experimentLogItems(selected),
-        pairId: experimentPairId(
-          '$uid|${position.latitude.toStringAsFixed(3)},'
-          '${position.longitude.toStringAsFixed(3)}',
-        ),
-        latencyMs: stopwatch.elapsedMilliseconds,
-      );
-    } catch (_) {
-      _showSnack('Experimentul a eșuat. Încearcă din nou.');
-    } finally {
-      if (mounted) setState(() => _experimentBusy = false);
-    }
-  }
-
-  // Debug: ruleaza A si B pe ACELASI pool, cu acelasi pairId -> perechea
-  // before/after pentru lucrare. Afiseaza pe harta bratul curent selectat.
-  Future<void> _runBothArms() async {
-    if (_experimentBusy) return;
-    setState(() => _experimentBusy = true);
-    try {
-      final fetched = await _fetchExperimentPool();
-      if (fetched == null || !mounted) return;
-      final (position, pool) = fetched;
-      final profile = normalizedThemeProfile(_tasteProfile.counts);
-      final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
-      final coords =
-          '${position.latitude.toStringAsFixed(4)},'
-          '${position.longitude.toStringAsFixed(4)}';
-      // Acelasi pairId pentru ambele brate la aceasta rulare pereche.
-      final pairId = experimentPairId(
-        '$uid|${position.latitude.toStringAsFixed(3)},'
-        '${position.longitude.toStringAsFixed(3)}|'
-        '${DateTime.now().millisecondsSinceEpoch}',
-      );
-
-      final selections = <ContextMode, List<ScoredCandidate>>{};
-      for (final arm in ContextMode.values) {
-        final stopwatch = Stopwatch()..start();
-        final selected = selectArm(
-          mode: arm,
-          pool: pool,
-          profileThemes: profile,
-          originLat: position.latitude,
-          originLng: position.longitude,
-          n: _experimentN,
-        );
-        stopwatch.stop();
-        selections[arm] = selected;
-        await logRun(
-          arm: arm.arm,
-          surface: 'home',
-          uid: uid,
-          query: 'nearby@$coords',
-          items: _experimentLogItems(selected),
-          pairId: pairId,
-          latencyMs: stopwatch.elapsedMilliseconds,
-        );
-      }
-      if (!mounted) return;
-      _showExperimentArm(
-        arm: _experimentArm,
-        selected: selections[_experimentArm]!,
-      );
-      _showSnack(
-        'Logged A=${selections[ContextMode.none]!.length}, '
-        'B=${selections[ContextMode.full]!.length} · pairId=$pairId',
-      );
-    } catch (_) {
-      _showSnack('Experimentul a eșuat. Încearcă din nou.');
-    } finally {
-      if (mounted) setState(() => _experimentBusy = false);
-    }
   }
 
   Future<void> _stopNavigation({required bool freeRoute}) async {
@@ -1690,7 +1522,9 @@ class _HomePageState extends State<HomePage> {
           radius: radius,
           excludeIds: excluded,
         );
-        if (results.isNotEmpty) break;
+        // ca mai sus: largim raza pana avem destule atractii reale, ca stratul
+        // de baza sa nu ramana cu 1-2 pini intr-o zona saraca.
+        if (results.length >= 6) break;
       }
       if (!mounted || results.isEmpty) return;
       final places = results.map(
@@ -1707,6 +1541,10 @@ class _HomePageState extends State<HomePage> {
     } catch (_) {}
   }
 
+  // cheia unde reținem ce loc aștepta o poză, ca s-o putem completa dacă Android
+  // ne-a ucis activitatea cât era camera deschisă (image_picker „lost data").
+  static const String _pendingMemoryKey = 'pending_memory_capture';
+
   Future<String?> _captureMemoryPhoto(
     String placeId, {
     String name = '',
@@ -1715,6 +1553,20 @@ class _HomePageState extends State<HomePage> {
     double? lng,
     List<String> types = const [],
   }) async {
+    final prefs = await SharedPreferences.getInstance();
+    // Reținem contextul ÎNAINTE de a deschide camera: dacă Android ne ucide
+    // activitatea, recuperăm poza la următoarea pornire (_recoverLostMemoryPhoto).
+    await prefs.setString(
+      _pendingMemoryKey,
+      jsonEncode({
+        'placeId': placeId,
+        'name': name,
+        'subtitle': subtitle,
+        'lat': lat,
+        'lng': lng,
+        'types': types,
+      }),
+    );
     try {
       final picked = await _picker.pickImage(
         source: ImageSource.camera,
@@ -1722,43 +1574,12 @@ class _HomePageState extends State<HomePage> {
         maxWidth: 1280,
         maxHeight: 1280,
       );
-      if (picked == null) return null;
-      final localPath = await PhotoLocal.persist(picked, 'memory_$placeId');
-      if (localPath != null) {
-        await PhotoLocal.saveToGallery(localPath, _galleryAlbum);
+      if (picked == null) {
+        _showSnack('Nicio poză capturată.');
+        return null;
       }
-
-      // urc poza în cloud ca s-o avem și pe web / pe alte device-uri
-      String imageUrl = '';
-      final user = FirebaseAuth.instance.currentUser;
-      if (user != null) {
-        try {
-          final ref = FirebaseStorage.instance
-              .ref()
-              .child('users')
-              .child(user.uid)
-              .child('memories')
-              .child('place_$placeId.jpg');
-          await ref.putData(await picked.readAsBytes());
-          imageUrl = await ref.getDownloadURL();
-        } catch (_) {}
-      }
-
-      final prefs = await SharedPreferences.getInstance();
-      // Cheile sunt per-utilizator ca să nu se amestece amintirile între conturi
-      // pe același dispozitiv.
-      if (user != null) {
-        if (localPath != null) {
-          await prefs.setString('memory_photo_${user.uid}_$placeId', localPath);
-        }
-        if (imageUrl.isNotEmpty) {
-          await prefs.setString(
-            'memory_photo_url_${user.uid}_$placeId',
-            imageUrl,
-          );
-        }
-      }
-      await _recordVisitedPlace(
+      final path = await _storeMemoryPhoto(
+        picked,
         placeId: placeId,
         name: name,
         subtitle: subtitle,
@@ -1766,12 +1587,147 @@ class _HomePageState extends State<HomePage> {
         lng: lng,
         types: types,
       );
+      await prefs.remove(_pendingMemoryKey);
       _showSnack('Memory photo saved.');
-      return localPath ?? imageUrl;
-    } catch (_) {
-      _showSnack('Could not save memory photo.');
+      return path;
+    } catch (e) {
+      _showSnack('Could not save memory photo: $e');
       return null;
     }
+  }
+
+  // Salvează efectiv o poză capturată: copie locală + galerie + marcare vizitat +
+  // upload best-effort. Folosit și de fluxul normal, și de recuperarea lost-data.
+  Future<String?> _storeMemoryPhoto(
+    XFile picked, {
+    required String placeId,
+    String name = '',
+    String subtitle = '',
+    double? lat,
+    double? lng,
+    List<String> types = const [],
+  }) async {
+    final localPath = await PhotoLocal.persist(picked, 'memory_$placeId');
+    if (localPath != null) {
+      await PhotoLocal.saveToGallery(localPath, _galleryAlbum);
+    }
+    final user = FirebaseAuth.instance.currentUser;
+    final prefs = await SharedPreferences.getInstance();
+    // Marcăm vizitat și salvăm calea locală ÎNAINTE de upload-ul în cloud, ca o
+    // eroare de Storage (ex. plan Firebase free) să nu blocheze nici poza, nici
+    // marcarea „vizitat".
+    if (user != null && localPath != null) {
+      await prefs.setString('memory_photo_${user.uid}_$placeId', localPath);
+    }
+    await _recordVisitedPlace(
+      placeId: placeId,
+      name: name,
+      subtitle: subtitle,
+      lat: lat,
+      lng: lng,
+      types: types,
+    );
+    String imageUrl = '';
+    if (user != null) {
+      try {
+        final ref = FirebaseStorage.instance
+            .ref()
+            .child('users')
+            .child(user.uid)
+            .child('memories')
+            .child('place_$placeId.jpg');
+        await ref.putData(await picked.readAsBytes());
+        imageUrl = await ref.getDownloadURL();
+        if (imageUrl.isNotEmpty) {
+          await prefs.setString('memory_photo_url_${user.uid}_$placeId', imageUrl);
+        }
+      } catch (_) {}
+    }
+
+    // Pin amintirea pe harta la locul fotografiat — marker cu poza, persistat in
+    // `memories` ca sa reapara dupa repornire (ca la camera din bara de jos).
+    // Inainte fluxul „poza la un loc" salva poza dar nu punea niciun marker.
+    if (lat != null && lng != null) {
+      await _addPhotoMemory(
+        id: 'place_$placeId',
+        position: LatLng(lat, lng),
+        localPath: localPath,
+        imageUrl: imageUrl,
+      );
+    }
+    return localPath;
+  }
+
+  // Adauga/actualizeaza o amintire foto pe harta si o persista in `memories`
+  // (per-user), ca sa reapara dupa repornire. Dedup pe id: re-fotografierea
+  // aceluiasi loc actualizeaza markerul existent in loc sa-l dubleze.
+  Future<void> _addPhotoMemory({
+    required String id,
+    required LatLng position,
+    required String? localPath,
+    required String imageUrl,
+  }) async {
+    final memory = _PhotoMemory(
+      id: id,
+      imageUrl: imageUrl,
+      localPath: localPath,
+      position: position,
+      takenAt: DateTime.now(),
+    );
+    final user = FirebaseAuth.instance.currentUser;
+    if (user != null) {
+      try {
+        await FirebaseFirestore.instance
+            .collection('users')
+            .doc(user.uid)
+            .collection('memories')
+            .doc(id)
+            .set({
+              'lat': position.latitude,
+              'lng': position.longitude,
+              'takenAt': Timestamp.fromDate(memory.takenAt),
+              'imageUrl': imageUrl,
+              'localPath': localPath ?? '',
+            });
+      } catch (_) {}
+    }
+    if (!mounted) return;
+    setState(() {
+      _photoMemories
+        ..removeWhere((m) => m.id == id)
+        ..add(memory);
+      _photoMemoryMarkers = _buildPhotoMemoryMarkers();
+    });
+  }
+
+  // Android poate ucide app-ul cât e camera deschisă; la repornire recuperăm poza
+  // pierdută și completăm salvarea pentru locul reținut în prefs.
+  Future<void> _recoverLostMemoryPhoto() async {
+    try {
+      final lost = await _picker.retrieveLostData();
+      if (lost.isEmpty || lost.file == null) return;
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_pendingMemoryKey);
+      if (raw == null) return;
+      final ctx = jsonDecode(raw) as Map<String, dynamic>;
+      final placeId = ctx['placeId']?.toString() ?? '';
+      if (placeId.isEmpty) return;
+      final path = await _storeMemoryPhoto(
+        lost.file!,
+        placeId: placeId,
+        name: ctx['name']?.toString() ?? '',
+        subtitle: ctx['subtitle']?.toString() ?? '',
+        lat: (ctx['lat'] as num?)?.toDouble(),
+        lng: (ctx['lng'] as num?)?.toDouble(),
+        types:
+            (ctx['types'] as List?)?.map((e) => e.toString()).toList() ??
+            const <String>[],
+      );
+      await prefs.remove(_pendingMemoryKey);
+      if (!mounted || path == null || path.isEmpty) return;
+      setState(() => _memoryPhotoCache[placeId] = path);
+      _showSnack('Poză recuperată și salvată.');
+    } catch (_) {}
   }
 
   Future<void> _recordVisitedPlace({
@@ -1785,19 +1741,22 @@ class _HomePageState extends State<HomePage> {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null || name.trim().isEmpty) return;
     try {
+      final data = <String, dynamic>{
+        'name': name,
+        'subtitle': subtitle,
+        'lat': lat,
+        'lng': lng,
+        'visitedAt': FieldValue.serverTimestamp(),
+      };
+      // La fel ca la favorite: nu suprascrie tipurile cu o listă goală când locul
+      // vine din popup-ul de detalii (fără tipuri Places).
+      if (types.isNotEmpty) data['types'] = types;
       await FirebaseFirestore.instance
           .collection('users')
           .doc(user.uid)
           .collection('visited')
           .doc(placeId)
-          .set({
-            'name': name,
-            'subtitle': subtitle,
-            'lat': lat,
-            'lng': lng,
-            'types': types,
-            'visitedAt': FieldValue.serverTimestamp(),
-          });
+          .set(data, SetOptions(merge: true));
     } catch (_) {}
   }
 
@@ -2016,6 +1975,11 @@ class _HomePageState extends State<HomePage> {
     required double? lat,
     required double? lng,
   }) {
+    // Re-verificam favoritul din Firestore o data per deschidere (vezi
+    // _showNearbyPlaceDetails): altfel inima ramane rosie dupa stergerea din
+    // alta parte.
+    var favoriteSynced = false;
+    var userToggledFavorite = false;
     showDialog<void>(
       context: context,
       builder: (context) {
@@ -2026,9 +1990,10 @@ class _HomePageState extends State<HomePage> {
         return StatefulBuilder(
           builder: (context, setState) {
             var isFavorite = _favoriteCache[placeId] ?? false;
-            if (!_favoriteCache.containsKey(placeId)) {
+            if (!favoriteSynced) {
+              favoriteSynced = true;
               _loadFavoriteStatus(placeId).then((value) {
-                if (!mounted) return;
+                if (!mounted || userToggledFavorite) return;
                 setState(() {
                   _favoriteCache[placeId] = value;
                 });
@@ -2118,7 +2083,9 @@ class _HomePageState extends State<HomePage> {
                             ),
                             const SizedBox(width: 8),
                             _circleIconButton(
-                              icon: Icons.favorite,
+                              icon: isFavorite
+                                  ? Icons.favorite
+                                  : Icons.favorite_border,
                               color: isFavorite ? Colors.red : Colors.white,
                               onPressed: () async {
                                 final user = FirebaseAuth.instance.currentUser;
@@ -2126,20 +2093,30 @@ class _HomePageState extends State<HomePage> {
                                   _showSnack('Sign in to save favorites.');
                                   return;
                                 }
+                                userToggledFavorite = true;
                                 final next = !isFavorite;
+                                // update optimist + revert daca scrierea pica
                                 setState(() {
                                   _favoriteCache[placeId] = next;
                                 });
-                                await _setFavorite(
-                                  placeId: placeId,
-                                  isFavorite: next,
-                                  name: resolvedName,
-                                  subtitle: subtitle,
-                                  description: resolvedDescription,
-                                  imageUrl: imageUrl,
-                                  lat: lat,
-                                  lng: lng,
-                                );
+                                try {
+                                  await _setFavorite(
+                                    placeId: placeId,
+                                    isFavorite: next,
+                                    name: resolvedName,
+                                    subtitle: subtitle,
+                                    description: resolvedDescription,
+                                    imageUrl: imageUrl,
+                                    lat: lat,
+                                    lng: lng,
+                                  );
+                                } catch (_) {
+                                  if (!mounted) return;
+                                  setState(() {
+                                    _favoriteCache[placeId] = isFavorite;
+                                  });
+                                  _showSnack('Could not update favorites.');
+                                }
                               },
                             ),
                           ],
@@ -2217,61 +2194,6 @@ class _HomePageState extends State<HomePage> {
             ),
           );
         }).toList(),
-      ),
-    );
-  }
-
-  // Bara experimentului: toggle braț (Generic = A / Personalizat = B), N-ul
-  // afisat ca dovada ca ambele brate intorc acelasi numar, si butonul de debug
-  // care ruleaza ambele brate pe acelasi pool.
-  Widget _buildExperimentBar(bool isDark) {
-    return Material(
-      elevation: 4,
-      borderRadius: BorderRadius.circular(12),
-      color: isDark ? Colors.black : Colors.white,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-        child: Row(
-          children: [
-            Expanded(
-              child: SegmentedButton<ContextMode>(
-                segments: const [
-                  ButtonSegment(
-                    value: ContextMode.none,
-                    label: Text('Generic'),
-                    icon: Icon(Icons.public, size: 16),
-                  ),
-                  ButtonSegment(
-                    value: ContextMode.full,
-                    label: Text('Personalizat'),
-                    icon: Icon(Icons.person_pin_circle, size: 16),
-                  ),
-                ],
-                selected: {_experimentArm},
-                showSelectedIcon: false,
-                onSelectionChanged: _experimentBusy
-                    ? null
-                    : (selection) => _runExperimentArm(selection.first),
-              ),
-            ),
-            const SizedBox(width: 8),
-            Chip(
-              visualDensity: VisualDensity.compact,
-              label: Text('N=$_experimentN'),
-            ),
-            IconButton(
-              tooltip: 'Rulează ambele brațe',
-              onPressed: _experimentBusy ? null : _runBothArms,
-              icon: _experimentBusy
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.compare_arrows),
-            ),
-          ],
-        ),
       ),
     );
   }

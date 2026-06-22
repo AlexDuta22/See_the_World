@@ -8,6 +8,11 @@
 # The following line activates a set of recommended lints for Flutter apps,
 # packages, and plugins designed to encourage good coding practices.
 analyzer:
+  # Codul modului experimental (studiile de caz) e arhivat aici ca dovadă, dar
+  # NU face parte din aplicație: îl excludem din analiză ca să nu influențeze
+  # build-ul sau `flutter analyze`. Vezi docs/experiment/README.md.
+  exclude:
+    - docs/**
   errors:
     unnecessary_underscores: ignore
 include: package:flutter_lints/flutter.yaml
