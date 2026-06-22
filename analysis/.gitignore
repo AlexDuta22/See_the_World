@@ -3,3 +3,5 @@ serviceAccount*.json
 *serviceaccount*.json
 ai_logs_runs.csv
 ai_logs_pairs.csv
+ai_logs_export.sqlite
+__pycache__/
