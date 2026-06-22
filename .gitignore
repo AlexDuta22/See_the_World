@@ -6,6 +6,9 @@
 android/app/src/main/res/values/google_maps_api.xml
 android/app/src/main/res/values/facebook.xml
 
+# Ghid de setup local (NU se comite)
+/docs/setup-web-ios.md
+
 # Fisiere template .example - nedorite in proiect
 *.example
 

@@ -3,10 +3,12 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../services/tile_cache.dart';
 import '../widgets/app_bottom_nav.dart';
 import 'ai_assistant_page.dart';
 import 'favorite_places_page.dart';
 import 'home_page.dart';
+import 'offline_tour_map_page.dart';
 import 'profile_page.dart';
 
 class OfflineToursPage extends StatefulWidget {
@@ -20,6 +22,7 @@ class _OfflineToursPageState extends State<OfflineToursPage> {
   static const String _timisoaraTourKey = 'offline_tour_timisoara_v2';
   bool _isDownloading = false;
   bool _isDownloaded = false;
+  double _downloadProgress = 0;
 
   @override
   void initState() {
@@ -38,7 +41,10 @@ class _OfflineToursPageState extends State<OfflineToursPage> {
 
   Future<void> _downloadTimisoaraTour() async {
     if (_isDownloading) return;
-    setState(() => _isDownloading = true);
+    setState(() {
+      _isDownloading = true;
+      _downloadProgress = 0;
+    });
     try {
       final places = <Map<String, dynamic>>[
         {
@@ -133,6 +139,28 @@ class _OfflineToursPageState extends State<OfflineToursPage> {
 
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_timisoaraTourKey, jsonEncode(places));
+
+      // Pre-descarcam dalele de hart\u0103 ale centrului Timi\u0219oarei, ca turul s\u0103
+      // mearg\u0103 f\u0103r\u0103 internet. Pe web open() \u00eentoarce null \u0219i s\u0103rim peste.
+      final cache = await TileCache.open();
+      if (cache != null) {
+        await cache.downloadRegion(
+          minLat: 45.745,
+          minLng: 21.215,
+          maxLat: 45.765,
+          maxLng: 21.240,
+          minZoom: 13,
+          maxZoom: 17,
+          onProgress: (done, total) {
+            if (mounted) {
+              setState(
+                () => _downloadProgress = total == 0 ? 0 : done / total,
+              );
+            }
+          },
+        );
+      }
+
       if (!mounted) return;
       setState(() => _isDownloaded = true);
       _showSnack('Timi\u015foara City Tour downloaded.');
@@ -168,37 +196,42 @@ class _OfflineToursPageState extends State<OfflineToursPage> {
               leading: const Icon(Icons.route, color: Color(0xFF1565C0)),
               title: const Text('Timi\u015foara City Tour'),
               subtitle: Text(
-                _isDownloaded
-                    ? 'Tap to explore on map \u00b7 8 stops'
-                    : 'Download 8 stops for offline access.',
+                _isDownloading
+                    ? 'Downloading map tiles\u2026 '
+                          '${(_downloadProgress * 100).round()}%'
+                    : _isDownloaded
+                    ? 'Tap to explore on map \u00b7 8 stops \u00b7 offline'
+                    : 'Download 8 stops + map for offline access.',
               ),
               onTap: _isDownloaded
                   ? () => Navigator.of(context).pushReplacement(
-                        MaterialPageRoute(
-                          builder: (_) => const HomePage(showTour: true),
-                        ),
-                      )
+                      MaterialPageRoute(
+                        builder: (_) => const OfflineTourMapPage(),
+                      ),
+                    )
                   : null,
               trailing: _isDownloading
-                  ? const SizedBox(
+                  ? SizedBox(
                       width: 22,
                       height: 22,
-                      child: CircularProgressIndicator(strokeWidth: 2),
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        value: _downloadProgress > 0 && _downloadProgress < 1
+                            ? _downloadProgress
+                            : null,
+                      ),
                     )
                   : IconButton(
                       icon: Icon(
-                        _isDownloaded
-                            ? Icons.map_outlined
-                            : Icons.download,
+                        _isDownloaded ? Icons.map_outlined : Icons.download,
                       ),
                       tooltip: _isDownloaded ? 'Open tour' : 'Download',
                       onPressed: _isDownloaded
                           ? () => Navigator.of(context).pushReplacement(
-                                MaterialPageRoute(
-                                  builder: (_) =>
-                                      const HomePage(showTour: true),
-                                ),
-                              )
+                              MaterialPageRoute(
+                                builder: (_) => const OfflineTourMapPage(),
+                              ),
+                            )
                           : _downloadTimisoaraTour,
                     ),
             ),

@@ -50,6 +50,8 @@ dependencies:
   flutter_tts: ^4.0.2
   cloud_functions: ^6.3.1
   gal: ^2.3.2
+  flutter_map: ^8.3.0
+  latlong2: ^0.9.1
 
 
 dev_dependencies:

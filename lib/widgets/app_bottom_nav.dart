@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 class AppBottomNav extends StatelessWidget {
@@ -24,10 +25,8 @@ class AppBottomNav extends StatelessWidget {
     if (isKeyboardOpen) return const SizedBox.shrink();
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final background = isDark ? Colors.black : Colors.grey.shade100;
-    final baseColor =
-        isDark ? Colors.grey.shade200 : Colors.blueGrey.shade800;
-    final selectedColor =
-        isDark ? Colors.white : Colors.blueGrey.shade900;
+    final baseColor = isDark ? Colors.grey.shade200 : Colors.blueGrey.shade800;
+    final selectedColor = isDark ? Colors.white : Colors.blueGrey.shade900;
 
     return SafeArea(
       top: false,
@@ -47,16 +46,19 @@ class AppBottomNav extends StatelessWidget {
                 onTap: onProfile,
               ),
             ),
-            Expanded(
-              child: _NavButton(
-                icon: Icons.offline_pin_outlined,
-                label: 'Offline Tours',
-                isSelected: currentIndex == 1,
-                baseColor: baseColor,
-                selectedColor: selectedColor,
-                onTap: onOffline,
+            // Tururile offline n-au sens pe web: nu poți încărca aplicația fără
+            // internet, deci ascundem complet intrarea acolo.
+            if (!kIsWeb)
+              Expanded(
+                child: _NavButton(
+                  icon: Icons.offline_pin_outlined,
+                  label: 'Offline Tours',
+                  isSelected: currentIndex == 1,
+                  baseColor: baseColor,
+                  selectedColor: selectedColor,
+                  onTap: onOffline,
+                ),
               ),
-            ),
             Expanded(
               child: _NavButton(
                 icon: Icons.camera_alt_outlined,
@@ -129,7 +131,11 @@ class _NavButton extends StatelessWidget {
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: color),
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: color,
+              ),
             ),
           ],
         ),
