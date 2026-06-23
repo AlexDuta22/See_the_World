@@ -1065,7 +1065,8 @@ class _HomePageState extends State<HomePage> {
       return Marker(
         markerId: MarkerId('photo_${m.id}'),
         position: m.position,
-        icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRose),
+        // magenta = amintirile foto (rose e deja folosit de tema Hotels)
+        icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueMagenta),
         infoWindow: const InfoWindow(title: 'Amintirea ta'),
         onTap: () => _showPhotoMemory(m),
       );
