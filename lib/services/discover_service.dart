@@ -97,6 +97,7 @@ class DiscoverService {
     required double radius,
     required Set<String> excludeIds,
     int limit = 20,
+    Map<DiscoverTheme, double> profileThemes = const {},
   }) async {
     const popularTypes = ['tourist_attraction', 'museum'];
     final merged = <String, DiscoverCandidate>{};
@@ -128,7 +129,7 @@ class DiscoverService {
       merged.putIfAbsent(c.placeId, () => c);
     }
     final list = _filterByQuality(merged.values.toList());
-    rank(list, lat: lat, lng: lng, radius: radius);
+    rank(list, lat: lat, lng: lng, radius: radius, profileThemes: profileThemes);
     return list.take(limit).toList();
   }
 
@@ -301,18 +302,28 @@ class DiscoverService {
     return (0.7 * (weighted / 5) + 0.3 * popularity).clamp(0.0, 1.0);
   }
 
-  // Scor final: 75% calitate (nota+popularitate), 25% apropiere. Prominenta unui
-  // obiectiv cunoscut conteaza mai mult decat cativa metri in plus.
+  // Scor final fara profil: 75% calitate (nota+popularitate), 25% apropiere.
+  // Prominenta unui obiectiv cunoscut conteaza mai mult decat cativa metri in plus.
+  //
+  // Cand primim un profil de gust (`profileThemes` ne-gol), inclinam puternic
+  // recomandarile spre categoriile preponderente: 50% potrivire cu profilul, 40%
+  // calitate, 10% apropiere. Asa un loc din tema preferata urca peste unul mai
+  // bine notat dar dintr-o categorie care nu il intereseaza pe user.
   void rank(
     List<DiscoverCandidate> list, {
     required double lat,
     required double lng,
     required double radius,
+    Map<DiscoverTheme, double> profileThemes = const {},
   }) {
     double score(DiscoverCandidate c) {
       final distance = Geolocator.distanceBetween(lat, lng, c.lat, c.lng);
       final proximity = 1 - (distance / radius).clamp(0.0, 1.0);
-      return 0.75 * _qualityScore(c) + 0.25 * proximity;
+      if (profileThemes.isEmpty) {
+        return 0.75 * _qualityScore(c) + 0.25 * proximity;
+      }
+      final match = profileMatchScore(c.types, profileThemes);
+      return 0.5 * match + 0.4 * _qualityScore(c) + 0.1 * proximity;
     }
 
     list.sort((a, b) => score(b).compareTo(score(a)));
@@ -382,4 +393,92 @@ class DiscoverService {
       return <String>{};
     }
   }
+
+  // Locurile salvate de user (favorite + vizitate), unite pe place_id (un loc
+  // poate fi si favorit, si vizitat). Le folosim ca strat prioritar pe harta si
+  // ca lista de excludere din Discover, ca acelasi loc sa nu apara de doua ori.
+  Future<List<SavedPlace>> savedPlaces(String uid) async {
+    final byId = <String, SavedPlace>{};
+    Future<void> read(String collection, {required bool favorite}) async {
+      try {
+        final snapshot = await FirebaseFirestore.instance
+            .collection('users')
+            .doc(uid)
+            .collection(collection)
+            .get();
+        for (final doc in snapshot.docs) {
+          final data = doc.data();
+          final lat = (data['lat'] as num?)?.toDouble();
+          final lng = (data['lng'] as num?)?.toDouble();
+          final types =
+              (data['types'] as List<dynamic>?)
+                  ?.map((e) => e.toString())
+                  .toList() ??
+              const <String>[];
+          final existing = byId[doc.id];
+          // Pentru un loc favorit+vizitat pastram datele bogate citite intai (din
+          // favorite); completam doar campurile pe care prima colectie nu le avea.
+          String keep(String? prev, String? incoming) {
+            if (prev != null && prev.isNotEmpty) return prev;
+            return incoming?.toString() ?? '';
+          }
+
+          byId[doc.id] = SavedPlace(
+            id: doc.id,
+            name: keep(existing?.name, data['name']?.toString()),
+            subtitle: keep(existing?.subtitle, data['subtitle']?.toString()),
+            description: keep(
+              existing?.description,
+              data['description']?.toString(),
+            ),
+            imageUrl: keep(existing?.imageUrl, data['imageUrl']?.toString()),
+            lat: existing?.lat ?? lat,
+            lng: existing?.lng ?? lng,
+            types: (existing?.types.isNotEmpty ?? false)
+                ? existing!.types
+                : types,
+            isFavorite: favorite || (existing?.isFavorite ?? false),
+            isVisited: !favorite || (existing?.isVisited ?? false),
+          );
+        }
+      } catch (_) {
+        // best-effort: daca o colectie pica, aratam ce am apucat sa citim
+      }
+    }
+
+    // favorite intai, ca un loc favorit+vizitat sa pastreze numele/poza salvate
+    await read('favorites', favorite: true);
+    await read('visited', favorite: false);
+    return byId.values.toList();
+  }
+}
+
+// Un loc din listele personale ale userului (favorite/vizitate). Tine si tipurile
+// Places, ca sa-l putem clasifica pe tema, si flagurile pentru pinul de pe harta.
+class SavedPlace {
+  const SavedPlace({
+    required this.id,
+    required this.name,
+    required this.subtitle,
+    required this.description,
+    required this.imageUrl,
+    required this.lat,
+    required this.lng,
+    required this.types,
+    required this.isFavorite,
+    required this.isVisited,
+  });
+
+  final String id;
+  final String name;
+  final String subtitle;
+  final String description;
+  final String imageUrl;
+  final double? lat;
+  final double? lng;
+  final List<String> types;
+  final bool isFavorite;
+  final bool isVisited;
+
+  bool get hasLocation => lat != null && lng != null;
 }

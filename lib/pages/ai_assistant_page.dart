@@ -37,6 +37,11 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   bool _english = false;
   String _partialText = '';
 
+  // Comutatorul de context. ON (implicit): asistentul foloseste contextul personal
+  // (locatie + profil de gusturi + locuri salvate/vizitate recent) ca sa
+  // personalizeze recomandarile. OFF: ignora tot acest context si raspunde generic.
+  bool _contextEnabled = true;
+
   // Locația curentă (reverse-geocodată) injectată în contextul AI, ca Gemini să
   // prioritizeze locuri apropiate. O luăm o singură dată per sesiune ca să nu
   // adăugăm latență/cereri la fiecare mesaj.
@@ -213,6 +218,25 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     });
     _tts.stop();
     _tts.setLanguage(_english ? 'en-US' : 'ro-RO');
+  }
+
+  void _toggleContext() {
+    setState(() => _contextEnabled = !_contextEnabled);
+    final String message;
+    if (_contextEnabled) {
+      message = _english
+          ? 'Context on — recommendations are personalized to you.'
+          : 'Context pornit — recomandările sunt personalizate pentru tine.';
+    } else {
+      message = _english
+          ? 'Context off — the assistant replies generically.'
+          : 'Context oprit — asistentul răspunde generic.';
+    }
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(content: Text(message), duration: const Duration(seconds: 2)),
+      );
   }
 
   Future<void> _toggleListening() async {
@@ -467,7 +491,8 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   }
 
   // Contextul de personalizare injectat în prompt: locație + profil de gusturi +
-  // locuri recente. Se construiește mereu (asistentul e personalizat by default).
+  // locuri recente. Se construiește doar cât timp comutatorul de context e ON
+  // (vezi _contextEnabled / _callGemini); pe OFF asistentul răspunde generic.
   String _contextText(_UserSignals s) {
     final themes = _profileThemes(s);
     final hasTaste = themes.isNotEmpty;
@@ -712,8 +737,11 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   }
 
   Future<_GeminiResult> _callGemini() async {
-    final signals = await _collectSignals();
-    final contextUsed = _contextText(signals);
+    // Cu contextul oprit nici nu mai colectam semnalele (locatie/profil): trimitem
+    // doar promptul + conversatia, ca raspunsul sa fie complet generic.
+    final contextUsed = _contextEnabled
+        ? _contextText(await _collectSignals())
+        : '';
     try {
       // _messages conține deja întreaga conversație, inclusiv mesajul tocmai
       // trimis de utilizator (adăugat în _sendMessage), așa că NU îl mai adăugăm
@@ -1014,6 +1042,18 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
               _english ? 'EN' : 'RO',
               style: const TextStyle(fontWeight: FontWeight.bold),
             ),
+          ),
+          // Comutator ON/OFF pentru contextul personal al asistentului.
+          IconButton(
+            icon: Icon(
+              _contextEnabled
+                  ? Icons.person_pin_circle
+                  : Icons.person_off_outlined,
+            ),
+            tooltip: _contextEnabled
+                ? (_english ? 'Context: ON' : 'Context: PORNIT')
+                : (_english ? 'Context: OFF' : 'Context: OPRIT'),
+            onPressed: _toggleContext,
           ),
           IconButton(
             icon: Icon(_ttsEnabled ? Icons.volume_up : Icons.volume_off),

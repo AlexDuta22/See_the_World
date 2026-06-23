@@ -26,6 +26,15 @@ class TasteProfile {
 
   List<DiscoverTheme> get topThemes => rankedThemes.take(3).toList();
 
+  // Ponderile temelor normalizate 0..1 (cat de mult inseamna fiecare categorie
+  // pentru user), folosite ca sa inclinam recomandarile spre categoriile
+  // preponderente. Gol cand nu avem nimic clasificat.
+  Map<DiscoverTheme, double> get normalizedWeights {
+    final total = counts.values.fold<int>(0, (acc, c) => acc + c);
+    if (total == 0) return const {};
+    return {for (final e in counts.entries) e.key: e.value / total};
+  }
+
   static const empty = TasteProfile(
     counts: {},
     rankedThemes: [],

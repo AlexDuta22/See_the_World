@@ -70,6 +70,10 @@ class _HomePageState extends State<HomePage> {
   // „Top places" luate de pe net (Google Places), nu din Firestore. Stratul de
   // baza al hartii pana cand Discover preia cu locatia reala a utilizatorului.
   Set<Marker> _topPlacesMarkers = {};
+  // Doar locurile VIZITATE de user (nu si favoritele). Strat prioritar: mereu
+  // vizibil pe harta, peste Discover, si exclus din pool ca sa nu apara de doua ori.
+  Set<Marker> _visitedMarkers = {};
+  Set<String> _visitedPlaceIds = {};
 
   // Discover pe harta: tema aleasa (null = Popular near you), profil, eticheta, raza
   DiscoverTheme? _selectedTheme;
@@ -118,6 +122,7 @@ class _HomePageState extends State<HomePage> {
     _initTopPlaces();
     _loadOfflineTour();
     _loadPhotoMemories();
+    _loadVisitedPlaces();
     _recoverLostMemoryPhoto();
     aiMapPlacesRequest.addListener(_handleAiPlacesRequest);
   }
@@ -146,6 +151,8 @@ class _HomePageState extends State<HomePage> {
       ..._searchMarkers,
       ..._aiMarkers,
       ..._photoMemoryMarkers,
+      // Locurile vizitate raman mereu pe harta, indiferent de tema/busola.
+      ..._visitedMarkers,
     };
     return Scaffold(
       resizeToAvoidBottomInset: false,
@@ -1317,6 +1324,55 @@ class _HomePageState extends State<HomePage> {
         });
   }
 
+  // Doar locurile VIZITATE ajung pe harta (favoritele raman doar in lista
+  // Favorite, fara pin). Tot de aici scoatem id-urile vizitate, ca Discover sa nu
+  // recomande un loc deja vizitat.
+  Future<void> _loadVisitedPlaces() async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+    try {
+      final places = await DiscoverService(
+        placesApiKey: _placesApiKey,
+      ).savedPlaces(uid);
+      final visited = places.where((p) => p.isVisited).toList();
+      if (!mounted) return;
+      setState(() {
+        _visitedPlaceIds = visited.map((p) => p.id).toSet();
+        _visitedMarkers = _buildVisitedMarkers(visited);
+      });
+    } catch (_) {}
+  }
+
+  Set<Marker> _buildVisitedMarkers(List<SavedPlace> places) {
+    final markers = <Marker>{};
+    for (final p in places) {
+      if (!p.hasLocation || p.name.isEmpty) continue;
+      markers.add(
+        Marker(
+          // prefix 'visited-' ca sa nu se ciocneasca cu pinii Discover/AI
+          markerId: MarkerId('visited-${p.id}'),
+          position: LatLng(p.lat!, p.lng!),
+          // pin galben = „am fost aici" (distinct de verdele temei Nature),
+          // indiferent daca e si favorit
+          icon: BitmapDescriptor.defaultMarkerWithHue(
+            BitmapDescriptor.hueYellow,
+          ),
+          infoWindow: InfoWindow(title: p.name, snippet: 'Visited'),
+          onTap: () => _showPlaceDetails(
+            placeId: p.id,
+            name: p.name,
+            subtitle: p.subtitle.isEmpty ? 'Visited' : p.subtitle,
+            description: p.description.isEmpty ? p.subtitle : p.description,
+            imageUrl: p.imageUrl,
+            lat: p.lat,
+            lng: p.lng,
+          ),
+        ),
+      );
+    }
+    return markers;
+  }
+
   // Construiește o singură dată profilul de gust din favorite/vizitate.
   Future<void> _ensureTasteProfile() async {
     if (_profileBuilt) return;
@@ -1352,10 +1408,15 @@ class _HomePageState extends State<HomePage> {
       final theme = _selectedTheme; // null = Popular near you
 
       final service = DiscoverService(placesApiKey: _placesApiKey);
-      final uid = FirebaseAuth.instance.currentUser?.uid;
-      final excluded = uid == null
-          ? <String>{}
-          : await service.visitedPlaceIds(uid);
+      // Reluam locurile vizitate ca stratul prioritar + excluderea sa fie la zi.
+      // Favoritele NU se exclud: pot aparea normal in Discover (cu culoarea temei).
+      await _loadVisitedPlaces();
+      final excluded = {..._visitedPlaceIds};
+
+      // Profilul de gust inclina „Popular near you" spre categoriile preponderente.
+      final profileWeights = hasHistory
+          ? _tasteProfile.normalizedWeights
+          : const <DiscoverTheme, double>{};
 
       var results = <DiscoverCandidate>[];
       var usedRadius = _discoverRadiusSteps.last;
@@ -1366,6 +1427,7 @@ class _HomePageState extends State<HomePage> {
                 lng: position.longitude,
                 radius: radius,
                 excludeIds: excluded,
+                profileThemes: profileWeights,
               )
             : await service.fetchForTheme(
                 theme: theme,
@@ -1511,9 +1573,11 @@ class _HomePageState extends State<HomePage> {
     try {
       final service = DiscoverService(placesApiKey: _placesApiKey);
       final uid = FirebaseAuth.instance.currentUser?.uid;
-      final excluded = uid == null
-          ? <String>{}
-          : await service.visitedPlaceIds(uid);
+      // Excludem doar locurile vizitate (le arata stratul lor prioritar). Daca
+      // inca nu s-au incarcat, le cerem direct din Firestore.
+      final excluded = _visitedPlaceIds.isNotEmpty
+          ? {..._visitedPlaceIds}
+          : (uid == null ? <String>{} : await service.visitedPlaceIds(uid));
       var results = <DiscoverCandidate>[];
       for (final radius in _discoverRadiusSteps) {
         results = await service.fetchPopular(
@@ -1521,6 +1585,7 @@ class _HomePageState extends State<HomePage> {
           lng: origin.longitude,
           radius: radius,
           excludeIds: excluded,
+          profileThemes: _tasteProfile.normalizedWeights,
         );
         // ca mai sus: largim raza pana avem destule atractii reale, ca stratul
         // de baza sa nu ramana cu 1-2 pini intr-o zona saraca.
@@ -1757,6 +1822,7 @@ class _HomePageState extends State<HomePage> {
           .collection('visited')
           .doc(placeId)
           .set(data, SetOptions(merge: true));
+      unawaited(_loadVisitedPlaces()); // pin „vizitat" pe stratul prioritar
     } catch (_) {}
   }
 

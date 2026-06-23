@@ -129,6 +129,25 @@ DiscoverTheme? themeForTypes(Iterable<String> types) {
   return null;
 }
 
+// Cat de bine se potriveste un loc cu profilul de gust (0..1). Mapam fiecare tip
+// al locului pe tema lui si luam ponderea cea mai mare din profil: locul „se
+// potriveste" cat de mult conteaza pentru user tema lui preponderenta. Profilul e
+// gol pana cand userul are istoric, caz in care intoarcem 0 (nicio preferinta).
+double profileMatchScore(
+  Iterable<String> placeTypes,
+  Map<DiscoverTheme, double> profileWeights,
+) {
+  if (profileWeights.isEmpty) return 0;
+  var best = 0.0;
+  for (final type in placeTypes) {
+    final theme = themeForTypes([type]);
+    if (theme == null) continue;
+    final weight = profileWeights[theme] ?? 0;
+    if (weight > best) best = weight;
+  }
+  return best.clamp(0.0, 1.0);
+}
+
 // utilitati/comert/industrie pe care nu le vrem niciodata ca destinatie
 // (lodging lipseste intentionat: e tinta temei Hotels)
 const Set<String> kJunkTypes = {
