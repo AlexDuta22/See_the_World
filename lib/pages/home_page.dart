@@ -49,6 +49,9 @@ class _HomePageState extends State<HomePage> {
   final Set<String> _photoLoading = {};
   final Set<String> _photoMissing = {};
   final Map<String, String> _memoryPhotoCache = {};
+  // descrierea locului adusa din Google Places Details (cache per place_id)
+  final Map<String, String> _placeDescriptions = {};
+  final Set<String> _descriptionLoading = {};
   bool _proximityActive = false;
   final Map<String, _NearbyPlace> _nearbyPlaces = {};
   Set<Marker> _nearbyMarkers = {};
@@ -123,6 +126,7 @@ class _HomePageState extends State<HomePage> {
     _loadOfflineTour();
     _loadPhotoMemories();
     _loadVisitedPlaces();
+    _cleanupGhostVisited();
     _recoverLostMemoryPhoto();
     aiMapPlacesRequest.addListener(_handleAiPlacesRequest);
   }
@@ -568,6 +572,51 @@ class _HomePageState extends State<HomePage> {
     if (reference == null || reference.isEmpty) return null;
     return 'https://maps.googleapis.com/maps/api/place/photo'
         '?maxwidth=800&photoreference=$reference&key=$_placesApiKey';
+  }
+
+  // Descrierea + poza locului din Google Places Details: editorial summary (sau
+  // adresa) si poza originala Google. Cache-uite per place_id ca sa nu cerem de
+  // doua ori; poza intra in _placePhotoUrls, ca la restul markerelor.
+  Future<void> _ensurePlaceInfo(String placeId) async {
+    if (_placesApiKey.isEmpty || placeId.isEmpty) return;
+    final haveDesc = _placeDescriptions.containsKey(placeId);
+    final havePhoto = _placePhotoUrls.containsKey(placeId);
+    if ((haveDesc && havePhoto) || _descriptionLoading.contains(placeId)) {
+      return;
+    }
+    _descriptionLoading.add(placeId);
+    try {
+      final result = await _fetchPlaceDetailsResult(placeId);
+      if (result == null) return;
+      final summary =
+          (result['editorial_summary'] as Map<String, dynamic>?)?['overview']
+              ?.toString();
+      final desc = (summary != null && summary.isNotEmpty)
+          ? summary
+          : result['formatted_address']?.toString();
+      if (desc != null && desc.isNotEmpty) _placeDescriptions[placeId] = desc;
+      final photo = _placePhotoUrl(result);
+      if (photo != null && photo.isNotEmpty) _placePhotoUrls[placeId] = photo;
+    } finally {
+      _descriptionLoading.remove(placeId);
+    }
+  }
+
+  Future<Map<String, dynamic>?> _fetchPlaceDetailsResult(String placeId) async {
+    final url = Uri.parse(
+      'https://maps.googleapis.com/maps/api/place/details/json'
+      '?place_id=$placeId'
+      '&fields=editorial_summary,formatted_address,photos'
+      '&key=$_placesApiKey',
+    );
+    try {
+      final response = await http.get(url);
+      if (response.statusCode != 200) return null;
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      return data['result'] as Map<String, dynamic>?;
+    } catch (_) {
+      return null;
+    }
   }
 
   void _showNearbyPlaceDetails(_NearbyPlace place) {
@@ -1061,16 +1110,54 @@ class _HomePageState extends State<HomePage> {
   }
 
   Set<Marker> _buildPhotoMemoryMarkers() {
-    return _photoMemories.map((m) {
-      return Marker(
-        markerId: MarkerId('photo_${m.id}'),
-        position: m.position,
-        // magenta = amintirile foto (rose e deja folosit de tema Hotels)
-        icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueMagenta),
-        infoWindow: const InfoWindow(title: 'Amintirea ta'),
-        onTap: () => _showPhotoMemory(m),
-      );
-    }).toSet();
+    // Pinul magenta „Amintirea ta" e doar pentru pozele libere (camera din bara).
+    // Poza facuta la un loc e reprezentata de pinul galben „Visited" (are iconita
+    // de galerie pe card), ca sa nu avem doua pini in acelasi punct.
+    return _photoMemories
+        .where((m) => !m.id.startsWith('place_'))
+        .map((m) {
+          return Marker(
+            markerId: MarkerId('photo_${m.id}'),
+            position: m.position,
+            // magenta = amintirile foto (rose e deja folosit de tema Hotels)
+            icon: BitmapDescriptor.defaultMarkerWithHue(
+              BitmapDescriptor.hueMagenta,
+            ),
+            infoWindow: const InfoWindow(title: 'Amintirea ta'),
+            onTap: () => _showPhotoMemory(m),
+          );
+        })
+        .toSet();
+  }
+
+  // amintirea foto a unui loc (pin „vizitat"): id-ul memoriei e „place_<placeId>"
+  _PhotoMemory? _memoryForPlace(String placeId) {
+    final id = 'place_$placeId';
+    for (final m in _photoMemories) {
+      if (m.id == id) return m;
+    }
+    return null;
+  }
+
+  // Imaginea mare de pe cardul locului: intai poza-amintire a locului (fisierul
+  // local daca mai exista, altfel cea uploadata), apoi imageUrl-ul din marker,
+  // altfel un placeholder.
+  // Imaginea mare de pe cardul locului: poza originala Google (din marker sau din
+  // Places Details). Poza ta personala se vede separat, din iconita de galerie.
+  Widget _detailHeroImage(String? url) {
+    Widget placeholder() => Container(
+      height: 220,
+      color: Colors.grey.shade200,
+      child: const Center(child: Icon(Icons.photo, color: Colors.black45)),
+    );
+    if (url == null || url.isEmpty) return placeholder();
+    return Image.network(
+      url,
+      height: 220,
+      width: double.infinity,
+      fit: BoxFit.cover,
+      errorBuilder: (_, _, _) => placeholder(),
+    );
   }
 
   void _showPhotoMemory(_PhotoMemory memory) {
@@ -1207,10 +1294,25 @@ class _HomePageState extends State<HomePage> {
             .child('${memory.id}.jpg')
             .delete();
       } catch (_) {}
+      // Amintirea la un loc = „vizitat"; stergem si marcajul ca sa nu ramana un
+      // pin „Visited" fara poza.
+      if (memory.id.startsWith('place_')) {
+        try {
+          await FirebaseFirestore.instance
+              .collection('users')
+              .doc(user.uid)
+              .collection('visited')
+              .doc(memory.id.substring(6))
+              .delete();
+        } catch (_) {}
+      }
     }
     final localPath = memory.localPath;
     if (localPath != null) {
       await PhotoLocal.delete(localPath);
+    }
+    if (memory.id.startsWith('place_')) {
+      await _loadVisitedPlaces();
     }
     if (mounted) _showSnack('Amintire ștearsă.');
   }
@@ -1372,6 +1474,34 @@ class _HomePageState extends State<HomePage> {
       );
     }
     return markers;
+  }
+
+  // Curata intrarile „visited" ramase fara o poza-memorie (fantome dintr-o
+  // versiune mai veche): un loc conteaza ca vizitat doar daca are o amintire foto.
+  Future<void> _cleanupGhostVisited() async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+    try {
+      final user = FirebaseFirestore.instance.collection('users').doc(uid);
+      final visitedSnap = await user.collection('visited').get();
+      if (visitedSnap.docs.isEmpty) return;
+      final memoriesSnap = await user.collection('memories').get();
+      final backedPlaceIds = memoriesSnap.docs
+          .where((d) => d.id.startsWith('place_'))
+          .map((d) => d.id.substring(6))
+          .toSet();
+      final batch = FirebaseFirestore.instance.batch();
+      var removed = 0;
+      for (final doc in visitedSnap.docs) {
+        if (!backedPlaceIds.contains(doc.id)) {
+          batch.delete(doc.reference);
+          removed++;
+        }
+      }
+      if (removed == 0) return;
+      await batch.commit();
+      await _loadVisitedPlaces();
+    } catch (_) {}
   }
 
   // Construiește o singură dată profilul de gust din favorite/vizitate.
@@ -2047,13 +2177,13 @@ class _HomePageState extends State<HomePage> {
     // alta parte.
     var favoriteSynced = false;
     var userToggledFavorite = false;
+    var descSynced = false;
     showDialog<void>(
       context: context,
       builder: (context) {
         final resolvedName = name.isEmpty ? 'Unknown place' : name;
-        final resolvedDescription = description.isEmpty
-            ? 'No description available.'
-            : description;
+        // poza-amintire facuta la acest loc (daca exista): hero + iconita galerie
+        final memory = _memoryForPlace(placeId);
         return StatefulBuilder(
           builder: (context, setState) {
             var isFavorite = _favoriteCache[placeId] ?? false;
@@ -2064,6 +2194,21 @@ class _HomePageState extends State<HomePage> {
                 setState(() {
                   _favoriteCache[placeId] = value;
                 });
+              });
+            }
+            // Descrierea: cea primita din marker, altfel descrierea locului din
+            // Google Places (editorial summary, apoi adresa), adusa o data async.
+            final fetchedDesc = _placeDescriptions[placeId];
+            final resolvedDescription = description.isNotEmpty
+                ? description
+                : (fetchedDesc != null && fetchedDesc.isNotEmpty
+                      ? fetchedDesc
+                      : 'No description available.');
+            if (description.isEmpty && !descSynced) {
+              descSynced = true;
+              _ensurePlaceInfo(placeId).then((_) {
+                if (!mounted) return;
+                setState(() {});
               });
             }
             return Dialog(
@@ -2079,34 +2224,11 @@ class _HomePageState extends State<HomePage> {
                         borderRadius: const BorderRadius.vertical(
                           top: Radius.circular(16),
                         ),
-                        child: imageUrl.isEmpty
-                            ? Container(
-                                height: 220,
-                                color: Colors.grey.shade200,
-                                child: const Center(
-                                  child: Icon(
-                                    Icons.photo,
-                                    color: Colors.black45,
-                                  ),
-                                ),
-                              )
-                            : Image.network(
-                                imageUrl,
-                                height: 220,
-                                width: double.infinity,
-                                fit: BoxFit.cover,
-                                // ignore: unnecessary_underscores
-                                errorBuilder: (_, __, ___) => Container(
-                                  height: 220,
-                                  color: Colors.grey.shade200,
-                                  child: const Center(
-                                    child: Icon(
-                                      Icons.photo,
-                                      color: Colors.black45,
-                                    ),
-                                  ),
-                                ),
-                              ),
+                        child: _detailHeroImage(
+                          imageUrl.isNotEmpty
+                              ? imageUrl
+                              : _placePhotoUrls[placeId],
+                        ),
                       ),
                       Positioned(
                         top: 12,
@@ -2131,6 +2253,13 @@ class _HomePageState extends State<HomePage> {
                                     },
                             ),
                             const SizedBox(width: 8),
+                            if (memory != null) ...[
+                              _circleIconButton(
+                                icon: Icons.photo_library_outlined,
+                                onPressed: () => _showPhotoMemory(memory),
+                              ),
+                              const SizedBox(width: 8),
+                            ],
                             _circleIconButton(
                               icon: Icons.camera_alt_outlined,
                               onPressed: () async {
