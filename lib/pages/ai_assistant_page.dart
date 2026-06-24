@@ -490,14 +490,28 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
     return [for (final e in ranked) MapEntry(e.key, e.value / total)];
   }
 
-  // Contextul de personalizare injectat în prompt: locație + profil de gusturi +
-  // locuri recente. Se construiește doar cât timp comutatorul de context e ON
-  // (vezi _contextEnabled / _callGemini); pe OFF asistentul răspunde generic.
-  String _contextText(_UserSignals s) {
+  // Linia de locație, IDENTICĂ în ambele brațe. Bază comună pentru Generic și
+  // Personalizat; diferența dintre brațe vine doar din contextul personal.
+  String _locationText(_UserSignals s) {
+    if (s.location.isEmpty) return '';
+    return _english
+        ? '\n\nThe user is currently ${s.location}. Prioritize places near this '
+          'location and reachable within the time the user says they have '
+          'available; estimate realistic travel time and do not suggest '
+          'destinations too far for their time budget.'
+        : '\n\nUtilizatorul se află acum ${s.location}. Prioritizează locuri '
+          'apropiate de această poziție și care pot fi atinse în timpul pe care '
+          'spune că îl are la dispoziție; estimează realist timpul de deplasare '
+          'și nu sugera destinații prea îndepărtate pentru timpul lui.';
+  }
+
+  // Contextul personal (profil de gust + locuri recente), adăugat DOAR pe
+  // brațul Personalizat, peste baza comună de locație.
+  String _personalContextText(_UserSignals s) {
     final themes = _profileThemes(s);
     final hasTaste = themes.isNotEmpty;
     final hasRecent = s.recentNames.isNotEmpty;
-    if (s.location.isEmpty && !hasTaste && !hasRecent) return '';
+    if (!hasTaste && !hasRecent) return '';
 
     final buffer = StringBuffer();
     if (_english) {
@@ -505,14 +519,6 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         '\n\nUser personalization context — use it to silently tailor every '
         'recommendation. Do NOT mention these preferences explicitly to the user.',
       );
-      if (s.location.isNotEmpty) {
-        buffer.write(
-          '\n- The user is currently ${s.location}. Prioritize places near this '
-          'location and reachable within the time the user says they have '
-          'available; estimate realistic travel time and do not suggest '
-          'destinations too far for their time budget.',
-        );
-      }
       if (hasTaste) {
         final formatted = themes
             .map((e) => '${_themeLabelEn[e.key]} ${(e.value * 100).round()}%')
@@ -543,14 +549,6 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
         'adaptezi discret fiecare recomandare. NU menționa explicit aceste '
         'preferințe utilizatorului.',
       );
-      if (s.location.isNotEmpty) {
-        buffer.write(
-          '\n- Utilizatorul se află acum ${s.location}. Prioritizează locuri '
-          'apropiate de această poziție și care pot fi atinse în timpul pe care '
-          'spune că îl are la dispoziție; estimează realist timpul de deplasare '
-          'și nu sugera destinații prea îndepărtate pentru timpul lui.',
-        );
-      }
       if (hasTaste) {
         final formatted = themes
             .map((e) => '${_themeLabelRo[e.key]} ${(e.value * 100).round()}%')
@@ -737,11 +735,12 @@ class _AiAssistantPageState extends State<AiAssistantPage> {
   }
 
   Future<_GeminiResult> _callGemini() async {
-    // Cu contextul oprit nici nu mai colectam semnalele (locatie/profil): trimitem
-    // doar promptul + conversatia, ca raspunsul sa fie complet generic.
+    // Semnalele se colectează întotdeauna, indiferent de braț: locația e bază
+    // comună, profilul rămâne disponibil și pentru logare pe ambele brațe.
+    final signals = await _collectSignals();
     final contextUsed = _contextEnabled
-        ? _contextText(await _collectSignals())
-        : '';
+        ? _locationText(signals) + _personalContextText(signals)  // Personalizat
+        : _locationText(signals);                                  // Generic
     try {
       // _messages conține deja întreaga conversație, inclusiv mesajul tocmai
       // trimis de utilizator (adăugat în _sendMessage), așa că NU îl mai adăugăm
