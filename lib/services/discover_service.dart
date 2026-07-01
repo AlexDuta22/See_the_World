@@ -7,6 +7,17 @@ import 'package:http/http.dart' as http;
 
 import 'discover_themes.dart';
 
+// Intrare de cache pentru un raspuns Places brut (lista de candidati + momentul
+// cererii). Tinem raspunsul deja parsat, ca reluarea sa nu implice iar JSON.
+class _PlacesCacheEntry {
+  _PlacesCacheEntry(this.candidates) : fetchedAt = DateTime.now();
+  final List<DiscoverCandidate> candidates;
+  final DateTime fetchedAt;
+
+  bool get isExpired =>
+      DateTime.now().difference(fetchedAt) > const Duration(minutes: 15);
+}
+
 // un loc candidat din Google Places (coordonatele vin direct din rezultat)
 class DiscoverCandidate {
   DiscoverCandidate({
@@ -35,6 +46,27 @@ class DiscoverService {
   DiscoverService({required this.placesApiKey});
 
   final String placesApiKey;
+
+  // Cache in memorie, comun tuturor instantelor DiscoverService din sesiune
+  // (fiecare tap pe un chip de tema creeaza o instanta noua). Evita sa
+  // refacem acelasi Nearby/Text Search cand userul comuta rapid intre teme
+  // sau cand ecranul se re-initializeaza pe aceeasi zona. Coordonatele sunt
+  // rotunjite la ~110m (4 zecimale) — suficient de fin cat sa nu amestece
+  // zone diferite, suficient de larg cat sa prinda re-cererile reale.
+  static final Map<String, _PlacesCacheEntry> _cache = {};
+
+  String _roundCoord(double v) => v.toStringAsFixed(4);
+
+  Future<List<DiscoverCandidate>> _cached(
+    String key,
+    Future<List<DiscoverCandidate>> Function() fetch,
+  ) async {
+    final hit = _cache[key];
+    if (hit != null && !hit.isExpired) return hit.candidates;
+    final result = await fetch();
+    _cache[key] = _PlacesCacheEntry(result);
+    return result;
+  }
 
   // candidati pentru o tema: interogam tipurile, unim, scoatem vizitatele, ordonam
   Future<List<DiscoverCandidate>> fetchForTheme({
@@ -145,62 +177,66 @@ class DiscoverService {
     required DiscoverTheme assignDefault,
   }) async {
     if (placesApiKey.isEmpty) return const [];
-    final url = Uri.parse(
-      'https://maps.googleapis.com/maps/api/place/textsearch/json'
-      '?query=${Uri.encodeComponent(query)}'
-      '&location=$lat,$lng&radius=${radius.round()}'
-      '&key=$placesApiKey',
-    );
-    try {
-      final response = await http.get(url);
-      if (response.statusCode != 200) return const [];
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      final results = data['results'] as List<dynamic>? ?? [];
-      final out = <DiscoverCandidate>[];
-      for (final item in results) {
-        final place = item as Map<String, dynamic>;
-        final placeId = place['place_id']?.toString();
-        final name = place['name']?.toString();
-        final location =
-            (place['geometry'] as Map<String, dynamic>?)?['location']
-                as Map<String, dynamic>?;
-        final pLat = location?['lat'] as num?;
-        final pLng = location?['lng'] as num?;
-        if (placeId == null || name == null || pLat == null || pLng == null) {
-          continue;
+    final key =
+        'text|$query|${_roundCoord(lat)}|${_roundCoord(lng)}|${radius.round()}';
+    return _cached(key, () async {
+      final url = Uri.parse(
+        'https://maps.googleapis.com/maps/api/place/textsearch/json'
+        '?query=${Uri.encodeComponent(query)}'
+        '&location=$lat,$lng&radius=${radius.round()}'
+        '&key=$placesApiKey',
+      );
+      try {
+        final response = await http.get(url);
+        if (response.statusCode != 200) return const [];
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final results = data['results'] as List<dynamic>? ?? [];
+        final out = <DiscoverCandidate>[];
+        for (final item in results) {
+          final place = item as Map<String, dynamic>;
+          final placeId = place['place_id']?.toString();
+          final name = place['name']?.toString();
+          final location =
+              (place['geometry'] as Map<String, dynamic>?)?['location']
+                  as Map<String, dynamic>?;
+          final pLat = location?['lat'] as num?;
+          final pLng = location?['lng'] as num?;
+          if (placeId == null || name == null || pLat == null || pLng == null) {
+            continue;
+          }
+          // Text Search e doar polarizat pe locatie, nu limitat — taiem ce e in
+          // afara razei ca eticheta „within X km" sa ramana corecta.
+          final distance = Geolocator.distanceBetween(
+            lat,
+            lng,
+            pLat.toDouble(),
+            pLng.toDouble(),
+          );
+          if (distance > radius) continue;
+          final types =
+              (place['types'] as List<dynamic>?)
+                  ?.map((e) => e.toString())
+                  .toList() ??
+              const <String>[];
+          if (!isTouristyTextResult(types.toSet())) continue;
+          out.add(
+            DiscoverCandidate(
+              placeId: placeId,
+              name: name,
+              lat: pLat.toDouble(),
+              lng: pLng.toDouble(),
+              theme: themeForTypes(types) ?? assignDefault,
+              types: types,
+              rating: (place['rating'] as num?)?.toDouble(),
+              userRatingsTotal: (place['user_ratings_total'] as num?)?.toInt(),
+            ),
+          );
         }
-        // Text Search e doar polarizat pe locatie, nu limitat — taiem ce e in
-        // afara razei ca eticheta „within X km" sa ramana corecta.
-        final distance = Geolocator.distanceBetween(
-          lat,
-          lng,
-          pLat.toDouble(),
-          pLng.toDouble(),
-        );
-        if (distance > radius) continue;
-        final types =
-            (place['types'] as List<dynamic>?)
-                ?.map((e) => e.toString())
-                .toList() ??
-            const <String>[];
-        if (!isTouristyTextResult(types.toSet())) continue;
-        out.add(
-          DiscoverCandidate(
-            placeId: placeId,
-            name: name,
-            lat: pLat.toDouble(),
-            lng: pLng.toDouble(),
-            theme: themeForTypes(types) ?? assignDefault,
-            types: types,
-            rating: (place['rating'] as num?)?.toDouble(),
-            userRatingsTotal: (place['user_ratings_total'] as num?)?.toInt(),
-          ),
-        );
+        return out;
+      } catch (_) {
+        return const [];
       }
-      return out;
-    } catch (_) {
-      return const [];
-    }
+    });
   }
 
   Future<List<DiscoverCandidate>> _nearby({
@@ -212,52 +248,56 @@ class DiscoverService {
     required DiscoverTheme Function(List<String> types) assign,
   }) async {
     if (placesApiKey.isEmpty) return const [];
-    final url = Uri.parse(
-      'https://maps.googleapis.com/maps/api/place/nearbysearch/json'
-      '?location=$lat,$lng&radius=${radius.round()}&type=$type'
-      '&key=$placesApiKey',
-    );
-    try {
-      final response = await http.get(url);
-      if (response.statusCode != 200) return const [];
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      final results = data['results'] as List<dynamic>? ?? [];
-      final out = <DiscoverCandidate>[];
-      for (final item in results) {
-        final place = item as Map<String, dynamic>;
-        final placeId = place['place_id']?.toString();
-        final name = place['name']?.toString();
-        final location =
-            (place['geometry'] as Map<String, dynamic>?)?['location']
-                as Map<String, dynamic>?;
-        final pLat = location?['lat'] as num?;
-        final pLng = location?['lng'] as num?;
-        if (placeId == null || name == null || pLat == null || pLng == null) {
-          continue;
+    final key =
+        'nearby|$type|${_roundCoord(lat)}|${_roundCoord(lng)}|${radius.round()}';
+    return _cached(key, () async {
+      final url = Uri.parse(
+        'https://maps.googleapis.com/maps/api/place/nearbysearch/json'
+        '?location=$lat,$lng&radius=${radius.round()}&type=$type'
+        '&key=$placesApiKey',
+      );
+      try {
+        final response = await http.get(url);
+        if (response.statusCode != 200) return const [];
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final results = data['results'] as List<dynamic>? ?? [];
+        final out = <DiscoverCandidate>[];
+        for (final item in results) {
+          final place = item as Map<String, dynamic>;
+          final placeId = place['place_id']?.toString();
+          final name = place['name']?.toString();
+          final location =
+              (place['geometry'] as Map<String, dynamic>?)?['location']
+                  as Map<String, dynamic>?;
+          final pLat = location?['lat'] as num?;
+          final pLng = location?['lng'] as num?;
+          if (placeId == null || name == null || pLat == null || pLng == null) {
+            continue;
+          }
+          final types =
+              (place['types'] as List<dynamic>?)
+                  ?.map((e) => e.toString())
+                  .toList() ??
+              const <String>[];
+          if (!isAllowedForTheme(types.toSet(), filterTheme)) continue;
+          out.add(
+            DiscoverCandidate(
+              placeId: placeId,
+              name: name,
+              lat: pLat.toDouble(),
+              lng: pLng.toDouble(),
+              theme: assign(types),
+              types: types,
+              rating: (place['rating'] as num?)?.toDouble(),
+              userRatingsTotal: (place['user_ratings_total'] as num?)?.toInt(),
+            ),
+          );
         }
-        final types =
-            (place['types'] as List<dynamic>?)
-                ?.map((e) => e.toString())
-                .toList() ??
-            const <String>[];
-        if (!isAllowedForTheme(types.toSet(), filterTheme)) continue;
-        out.add(
-          DiscoverCandidate(
-            placeId: placeId,
-            name: name,
-            lat: pLat.toDouble(),
-            lng: pLng.toDouble(),
-            theme: assign(types),
-            types: types,
-            rating: (place['rating'] as num?)?.toDouble(),
-            userRatingsTotal: (place['user_ratings_total'] as num?)?.toInt(),
-          ),
-        );
+        return out;
+      } catch (_) {
+        return const [];
       }
-      return out;
-    } catch (_) {
-      return const [];
-    }
+    });
   }
 
   // Filtru de calitate cu relaxare progresiva: pastram intai doar locurile bine
